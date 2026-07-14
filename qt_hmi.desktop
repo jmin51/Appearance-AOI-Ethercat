@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=QT HMI
+Comment=启动 QT HMI 控制面板
+Exec=bash -c "source ~/dev_ws/install/setup.bash && ros2 launch qt_hmi qt_hmi.launch.py"
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Development;

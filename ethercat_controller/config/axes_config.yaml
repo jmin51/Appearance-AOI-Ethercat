@@ -1,0 +1,93 @@
+# 伺服轴配置文件
+# brand: 驱动器品牌 (HUICHUAN/LEISAI)
+# name: 轴名称 (ROS2通信标识, 不可重复)
+# display_name: 轴显示名称 (HMI界面显示用, 不提供则默认使用name)
+# position: EtherCAT 从站位置 (从0开始)
+# axis_type: 轴类型 (AXIS1/AXIS2), 双轴驱动器的第1轴或第2轴
+# product_code: 产品编码 (0表示使用品牌默认值; 汇川: 0x000c0112或0x000c010d; 雷赛: 0x0000a400/0x00002700/0x0000a500)
+# gear_ratio: 减速比
+# calc_mode: 计算模式 (ANGLE=角度模式, DISPLACEMENT=位移模式)
+# jog_speed: 点动速度 (角度轴单位: °/s, 位移轴单位: mm/s)
+# min_jog_speed: 最小点动速度 (角度轴: °/s, 位移轴: mm/s, 不提供则默认1.0)
+# max_jog_speed: 最大点动速度 (角度轴: °/s, 位移轴: mm/s, 不提供则默认200.0)
+# auto_speed: 自动模式移动速度 (角度轴: °/s, 位移轴: mm/s, 不提供则默认5.0)
+
+servo_axes:
+  - brand: "HUICHUAN"
+    name: "axis1"
+    display_name: "龙门x"
+    position: 0
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 1.0
+    calc_mode: "DISPLACEMENT"
+    jog_speed: 30.0
+    min_jog_speed: 1.0
+    max_jog_speed: 100.0
+    auto_speed: 60.0
+
+  - brand: "HUICHUAN"
+    name: "axis2"
+    display_name: "龙门y"
+    position: 1
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 1.0
+    calc_mode: "DISPLACEMENT"
+    jog_speed: 20.0
+    min_jog_speed: 1.0
+    max_jog_speed: 100.0
+    auto_speed: 40.0
+
+  - brand: "HUICHUAN"
+    name: "axis3"
+    display_name: "龙门z"
+    position: 2
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 1.0
+    calc_mode: "DISPLACEMENT"
+    jog_speed: 10.0
+    min_jog_speed: 1.0
+    max_jog_speed: 100.0
+    auto_speed: 20.0
+
+  - brand: "HUICHUAN"
+    name: "axis4"
+    display_name: "侧面x"
+    position: 3
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 1.0
+    calc_mode: "DISPLACEMENT"
+    jog_speed: 30.0
+    min_jog_speed: 1.0
+    max_jog_speed: 100.0
+    auto_speed: 60.0
+
+  - brand: "HUICHUAN"
+    name: "axis5"
+    display_name: "侧面y"
+    position: 4
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 1.0
+    calc_mode: "DISPLACEMENT"
+    jog_speed: 30.0
+    min_jog_speed: 1.0
+    max_jog_speed: 100.0
+    auto_speed: 60.0
+
+  - brand: "HUICHUAN"
+    name: "axis6"
+    display_name: "旋转台"
+    position: 5
+    axis_type: "AXIS1"
+    product_code: 0x000c0112
+    gear_ratio: 30.0
+    calc_mode: "ANGLE"
+    jog_speed: 10.0
+    min_jog_speed: 1.0
+    max_jog_speed: 200.0
+    auto_speed: 20.0
+
