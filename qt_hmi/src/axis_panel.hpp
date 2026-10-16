@@ -5,6 +5,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QDoubleSpinBox>
+#include <QComboBox>
 #include <QInputDialog>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -15,8 +16,9 @@
 #include "ros2_bridge.hpp"
 
 /// 单轴位置控制面板 — 根据轴的 calc_mode 提供不同按钮组合
-/// DISPLACEMENT 轴 (axis4/5): 回原点/预设/正步进/负步进/位移输入/角度输入
-/// ANGLE 轴 (axis1-3/6-8): 角度输入/位移输入
+/// DISPLACEMENT 轴 (axes_config.yaml 中 axis1~axis5): 回原点/预设/正步进/负步进/位移输入/角度输入
+/// ANGLE 轴 (axes_config.yaml 中 axis6): 角度输入/位移输入
+/// 两种轴均支持"速度百分比"选择：默认档走 auto_speed，其余档走 *_pct 话题
 class AxisPanel : public QWidget
 {
     Q_OBJECT
@@ -59,4 +61,15 @@ private:
 
     QLabel *pos_label_;             // 位置显示标签
     QDoubleSpinBox *step_spin_;     // 步长调节 (仅DISPLACEMENT轴显示)
+    QComboBox *speed_pct_combo_ = nullptr;  // 速度百分比选择 ("默认" / 5~100)
+
+    // ————— 内部辅助 —————
+    /// 创建并填充速度百分比下拉框 (创建后需由调用方加入布局)
+    void initSpeedCombo();
+    /// 当前选择的速度百分比; 返回 -1 表示"默认速度"(使用 YAML 的 auto_speed)
+    int selectedPercent() const;
+    /// 发送位移指令: 按当前百分比选择 /displacement_command 或 /displacement_command_pct
+    void sendDisplacement(double position_mm);
+    /// 发送角度指令(单位:度): 按当前百分比选择 /angle_command 或 /angle_command_pct
+    void sendAngle(double angle_deg);
 };

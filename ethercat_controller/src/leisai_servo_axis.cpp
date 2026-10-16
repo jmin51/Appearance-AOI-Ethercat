@@ -66,20 +66,24 @@ void LeisaiServoAxis::configure(ec_master_t* master) {
                     "%s 轴PDO配置失败", axis_name_.c_str());
     }
     
-    // 判断是否为axis3并且复位按钮被按下
-    if (axis_name_ == "axis3" && g_reset_button_pressed.load()) {
+    // 回原轴在复位流程中切换为 HM 模式，其余情况保持 CSP 模式
+    // 是否回原由 YAML 的 operation_mode 字段决定，不再硬编码轴名
+    if (homing_mode_ && g_reset_button_pressed.load()) {
         ecrt_slave_config_sdo8(sc_, 0x6060, 0x00, 0x06);
+        // 本次会话必须等驱动器回原达标（状态字 bit12=Homing attained）才算就绪
+        begin_homing_session(true);
         RCLCPP_INFO(rclcpp::get_logger("ethercat_controller"),
                    "轴 %s 配置为 HM 模式 (复位/回原流程)", axis_name_.c_str());
-        // 重置复位按钮状态，避免重复配置
-        g_reset_button_pressed.store(false);
     } else {
-        // 其他轴，或 axis3 在非复位状态下，配置为 CSP 模式
         ecrt_slave_config_sdo8(sc_, 0x6060, 0x00, 0x08);
+        // CSP 会话：bit12 语义为"驱动器跟随指令值"，不参与回原/就绪判定
+        begin_homing_session(false);
         RCLCPP_INFO(rclcpp::get_logger("ethercat_controller"),
                    "轴 %s 配置为 CSP 模式", axis_name_.c_str());
     }
-    ecrt_slave_config_dc(sc_, 0x0300, PERIOD_NS, 0, 0, 0);
+    // SYNC0 偏移取半周期（500us）：把从站采样时刻从"过程数据更新边沿"挪到周期中部，
+    // 留出建立/保持窗口，避免几十 us 的抖动造成"读到本周期 / 上周期数据"翻转引起的抖动。
+    ecrt_slave_config_dc(sc_, 0x0300, PERIOD_NS, PERIOD_NS / 2, 0, 0);
 }
 
 void LeisaiServoAxis::register_pdo_entries(ec_pdo_entry_reg_t* reg_list, int& index) {
@@ -118,6 +122,9 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
     // 更新错误码
     current_error_code_ = error_code;
 
+    // 回原达标判定（仅 HM 会话生效）：维护 bit12 连续稳定计数并锁存，供就绪判定/INITIALIZING 拦截使用
+    update_homing_attainment(decode_pds_state(read_status_word), read_status_word);
+
     // 检查故障清除请求
     if (clear_fault_requested_ && current_state_ == AxisState::FAULT) {
         clear_fault_requested_ = false;
@@ -131,6 +138,9 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
     if (reset_requested_) {
         reset_requested_ = false;
         current_state_ = AxisState::UNINITIALIZED;
+        // 回原达标锁存清零：重置后必须重新回原达标，不能用旧的达标结果放行就绪
+        homing_attained_.store(false, std::memory_order_release);
+        homing_attained_stable_count_ = 0;
         // 重置运动状态，避免恢复时误判目标到达
         reset_motion_state();
         printf("轴 %s 执行重置，回到未初始化状态\n", axis_name_.c_str());
@@ -171,10 +181,27 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
             } else if (read_status_word == 0x0633 || read_status_word == 0x0733) {
                 EC_WRITE_S32(domain1_pd + off_target_position_, current_pos);
                 EC_WRITE_U16(domain1_pd + control_word_, 0x001F);
+
+                // 回原轴（HM 会话）：0x0633(Switched on) 时回原尚未完成（bit12=0），
+                // 必须继续等"使能 + bit12(Homing attained)"（完成瞬间 0x1637/0x1237/0x16b7，
+                // 由下面那个分支接管）才能进 READY；提前放行会让上层判"系统就绪→回原完成"
+                // 并执行 safe_shutdown，把驱动器正在进行的回原打断。
+                // 等待期间每周期都要写控制字，否则驱动器会掉出操作使能。
+                if (is_homing_required() && !is_homing_attained()) {
+                    if (++homing_wait_counter_ >= 3000) {  // 约 3s @1ms，仅告警不自动放行
+                        homing_wait_counter_ = 0;
+                        printf("轴 %s 等待回原完成: 状态字0x%04X（HM 回原中，bit12 未置位）\n",
+                            axis_name_.c_str(), read_status_word);
+                    }
+                    break;  // 留在 INITIALIZING
+                }
+
+                homing_wait_counter_ = 0;
                 printf("发送状态转换命令: 0x001F\n");
                 current_state_ = AxisState::READY;
                 printf("轴 %s 进入就绪状态\n", axis_name_.c_str());
             } else if (read_status_word == 0x1637 || read_status_word == 0x1237 || read_status_word == 0x16b7) {
+                homing_wait_counter_ = 0;
                 EC_WRITE_S32(domain1_pd + off_target_position_, current_pos);
                 current_state_ = AxisState::READY;
                 printf("轴 %s 进入就绪状态\n", axis_name_.c_str());
@@ -214,6 +241,11 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
                 start_auto_requested_ = false;
                 operation_mode_ = OperationMode::AUTO;
                 current_state_ = AxisState::AUTO_MODE;
+
+                // 清除非自动模式期间可能残留的位移指令：手动模式下 /displacement_command(_pct)
+                // 会被节点接受并写入 displacement_updated_，但手动处理函数只认点动、不消费该标志，
+                // 若不在切入自动时清掉，自动处理函数会把旧目标当成新指令执行
+                displacement_updated_ = false;
 
                 printf("轴 %s 进入自动模式\n", axis_name_.c_str());
             }
@@ -262,6 +294,7 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
                 printf("轴 %s 检测到故障状态字0x%04X，进入故障模式\n",
                     axis_name_.c_str(), read_status_word);
                 current_state_ = AxisState::FAULT;
+                prof_reset_requested_.store(true, std::memory_order_release);  // 退出手动模式：清剖面
                 break;
             }
             
@@ -270,6 +303,8 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
                 // 发送停止指令：保持当前位置
                 EC_WRITE_S32(domain1_pd + off_target_position_, current_pos);
                 EC_WRITE_U16(domain1_pd + control_word_, 0x0006);
+                prof_reset_requested_.store(true, std::memory_order_release);  // 硬停：清剖面
+                jog_stop_requested_ = false;   // 清点动停止标志，避免残留到后续状态
                 
                 // 检查轴是否已停止（速度为0或状态字变化）
                 // 这里简单处理：直接跳转，实际可根据需求添加停止确认
@@ -281,6 +316,7 @@ void LeisaiServoAxis::handle_state_machine(uint8_t* domain1_pd) {
             
             if (!(read_status_word == 0x1637 || read_status_word == 0x1237)) {
                 current_state_ = AxisState::INITIALIZING;
+                prof_reset_requested_.store(true, std::memory_order_release);  // 退出手动模式：清剖面
                 printf("轴 %s 退出手动模式\n", axis_name_.c_str());
             } else {
                 handle_leisai_manual_operation(domain1_pd, current_pos);
@@ -457,43 +493,17 @@ void LeisaiServoAxis::handle_leisai_manual_operation(uint8_t* domain1_pd, int32_
         std::lock_guard<std::mutex> lock(speed_mutex_);
         current_jog_speed = jog_speed_;
     }
-    
-    // 处理点动控制 —— 根据轴计算模式选择对应的转换函数
-    if (jog_forward_requested_) {
-        int32_t speed_pulses;
-        if (calc_mode_ == AxisCalcMode::ANGLE) {
-            speed_pulses = angle_to_pulses(current_jog_speed * PERIOD);
-        } else {
-            speed_pulses = displacement_to_pulses(current_jog_speed * PERIOD);
-        }
-        target_pulses_ += speed_pulses;
-    } else if (jog_reverse_requested_) {
-        int32_t speed_pulses;
-        if (calc_mode_ == AxisCalcMode::ANGLE) {
-            speed_pulses = angle_to_pulses(current_jog_speed * PERIOD);
-        } else {
-            speed_pulses = displacement_to_pulses(current_jog_speed * PERIOD);
-        }
-        target_pulses_ -= speed_pulses;
-    } else if (jog_stop_requested_) {
-        // 停止：保持当前位置
-        target_pulses_ = current_pos;
+
+    // 手动点动速度剖面（软起动 / 软停止 / 软换向）
+    //   dir: 正转 +1 / 反转 -1 / 无方向请求(含 jog_stop) 0 → 软停止
+    //   起步与停止均按 jog_accel/jog_decel 平滑过渡；半途松键安全（每周期重算目标速度）
+    const int dir = jog_forward_requested_ ? +1 : (jog_reverse_requested_ ? -1 : 0);
+    manual_jog_profile(dir, current_jog_speed, domain1_pd);
+
+    // 停稳后清一次性停止请求标志（软停止可持续多个周期，不能像硬停那样立即清）
+    if (dir == 0 && prof_v_ == 0.0) {
         jog_stop_requested_ = false;
     }
-    
-    // 限制最大速度 —— 同样根据轴类型选择转换方式
-    int32_t MAX_STEP;
-    if (calc_mode_ == AxisCalcMode::ANGLE) {
-        MAX_STEP = angle_to_pulses(max_jog_speed_ * PERIOD);
-    } else {
-        MAX_STEP = displacement_to_pulses(max_jog_speed_ * PERIOD);
-    }
-    int32_t error = target_pulses_ - joint_position_;
-    int32_t step = (abs(error) > MAX_STEP) ? 
-                  ((error > 0) ? MAX_STEP : -MAX_STEP) : error;
-    
-    joint_position_ += step;
-    EC_WRITE_S32(domain1_pd + off_target_position_, joint_position_);
 }
 
 void LeisaiServoAxis::handle_leisai_auto_operation(uint8_t* domain1_pd, int32_t current_pos) {

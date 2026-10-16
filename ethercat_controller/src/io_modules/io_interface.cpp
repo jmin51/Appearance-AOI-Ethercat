@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <modbus/modbus.h>
 #include <cstring>
+#include <exception>
 #include <time.h>
 #include <mutex>
 
@@ -18,9 +19,48 @@ int  g_do_base_address = 800;
 std::string g_di_device_ip = "192.168.1.84";
 std::string g_do_device_ip = "192.168.1.84";
 
-// DI/DO 信号地址数组（按结构体字段顺序，由YAML加载填充）
-int g_di_signal_addresses[DI_SIGNAL_COUNT];
-int g_do_signal_addresses[DO_SIGNAL_COUNT];
+// 有效点数（= 各自 yaml 的信号条数）
+int g_di_count = 0;
+int g_do_count = 0;
+
+// 角色 → 位偏移（IO_ROLE_NONE 表示未配置）
+int g_di_role_offset[DI_ROLE_COUNT];
+int g_do_role_offset[DO_ROLE_COUNT];
+
+// 被保护（不允许外部写）的 DO 位
+bool g_do_protected[IO_MAX_SIGNALS];
+
+bool g_emergency_stop_active_low = true;
+int  g_reset_confirm_ms = 3000;
+
+// IO 控模式下手自动按钮角色未配置时的默认模式（缺省手动，见头文件说明）
+bool g_default_auto_mode = false;
+
+int g_pause_reset_do[IO_MAX_SIGNALS];       int g_pause_reset_do_count = 0;
+int g_shutdown_reset_do[IO_MAX_SIGNALS];    int g_shutdown_reset_do_count = 0;
+
+// DI/DO 信号地址数组（下标 = 位偏移，由YAML加载填充）
+int g_di_signal_addresses[IO_MAX_SIGNALS];
+int g_do_signal_addresses[IO_MAX_SIGNALS];
+
+// 配置是否已成功加载
+static bool g_io_config_valid = false;
+
+// ===== 角色名表与必需性表 =====
+static const char *kDiRoleNames[DI_ROLE_COUNT] = {
+    "emergency_stop", "start_button", "reset_button",
+    "pause_button", "manual_auto_button"
+};
+static const bool kDiRoleRequired[DI_ROLE_COUNT] = {
+    true, true, true, true, false
+};
+static const char *kDoRoleNames[DO_ROLE_COUNT] = {
+    "buzzer", "red_light", "yellow_light", "green_light",
+    "start_button_light", "reset_button_light", "pause_button_light"
+};
+static const bool kDoRoleRequired[DO_ROLE_COUNT] = {
+    true, true, true, true, true, true, true
+};
 
 // Modbus 连接（所有模式变量始终存在，运行时按需使用）
 static modbus_t *ctx_io = NULL;  // 集成模式连接
@@ -56,8 +96,157 @@ static inline std::mutex& get_do_mutex() {
     return g_io_integrated_mode ? modbus_io_mutex : modbus_do_mutex;
 }
 
+// ===== 角色名/取值辅助 =====
+const char* di_role_name(DiRole role) {
+    if (role < 0 || role >= DI_ROLE_COUNT) return "?";
+    return kDiRoleNames[role];
+}
+
+const char* do_role_name(DoRole role) {
+    if (role < 0 || role >= DO_ROLE_COUNT) return "?";
+    return kDoRoleNames[role];
+}
+
+bool io_config_ok() {
+    return g_io_config_valid;
+}
+
+// 从 current_do_state.raw[] 按角色表回填语义字段
+static void apply_do_semantics_from_raw() {
+    for (int r = 0; r < DO_ROLE_COUNT; r++) {
+        int off = g_do_role_offset[r];
+        bool v = (off >= 0 && off < current_do_state.count) ? current_do_state.raw[off] : false;
+        switch (r) {
+            case DO_ROLE_BUZZER:             current_do_state.buzzer             = v; break;
+            case DO_ROLE_RED_LIGHT:          current_do_state.red_light          = v; break;
+            case DO_ROLE_YELLOW_LIGHT:       current_do_state.yellow_light       = v; break;
+            case DO_ROLE_GREEN_LIGHT:        current_do_state.green_light        = v; break;
+            case DO_ROLE_START_BUTTON_LIGHT: current_do_state.start_button_light = v; break;
+            case DO_ROLE_RESET_BUTTON_LIGHT: current_do_state.reset_button_light = v; break;
+            case DO_ROLE_PAUSE_BUTTON_LIGHT: current_do_state.pause_button_light = v; break;
+            default: break;
+        }
+    }
+}
+
+// 读取某个 DI 角色的电平（语义统一为：急停 true = 正常）
+bool di_role_value(const DI_Interface &di, DiRole role) {
+    if (role < 0 || role >= DI_ROLE_COUNT) return false;
+    const int off = g_di_role_offset[role];
+    if (off < 0 || off >= di.count || off >= IO_MAX_SIGNALS) {
+        // 角色未配置（或超出本次读取范围）：急停按"正常"处理，其余按"未触发"处理
+        return (role == DI_ROLE_EMERGENCY_STOP);
+    }
+    const bool raw = di.raw[off];
+    if (role == DI_ROLE_EMERGENCY_STOP) {
+        // 语义：true = 正常（未触发）
+        // active_low 时物理高电平 = 正常；否则物理低电平 = 正常
+        return g_emergency_stop_active_low ? raw : !raw;
+    }
+    return raw;
+}
+
+// ===== 配置解析辅助 =====
+
+// 解析 roles 段：值必须是 [base, base+sig_count) 内的整数地址，且互不重复；
+// 未知角色名 或 必需角色缺失 → 返回 false（拒绝启动）
+static bool parse_roles(const YAML::Node &node, const char *const *names, int role_count,
+                        const bool *required, int base, int sig_count,
+                        int *out_offset, const char *tag) {
+    for (int r = 0; r < role_count; r++) out_offset[r] = IO_ROLE_NONE;
+
+    if (node) {
+        if (!node.IsMap()) {
+            fprintf(stderr, "[IO] %s 必须是映射(key: address)\n", tag);
+            return false;
+        }
+        bool used[IO_MAX_SIGNALS] = {false};
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const std::string key = it->first.as<std::string>();
+            int idx = -1;
+            for (int r = 0; r < role_count; r++) {
+                if (key == names[r]) { idx = r; break; }
+            }
+            if (idx < 0) {
+                fprintf(stderr, "[IO] %s 出现未知角色名: '%s'\n", tag, key.c_str());
+                return false;
+            }
+            int addr = 0;
+            try {
+                addr = it->second.as<int>();
+            } catch (const std::exception &) {
+                fprintf(stderr, "[IO] %s.%s 必须是整数地址\n", tag, key.c_str());
+                return false;
+            }
+            const int off = addr - base;
+            if (off < 0 || off >= sig_count) {
+                fprintf(stderr, "[IO] %s.%s 地址 M%d 越界，应在 M%d ~ M%d\n",
+                        tag, key.c_str(), addr, base, base + sig_count - 1);
+                return false;
+            }
+            if (used[off]) {
+                fprintf(stderr, "[IO] %s 地址 M%d 被重复绑定\n", tag, addr);
+                return false;
+            }
+            used[off] = true;
+            out_offset[idx] = off;
+        }
+    }
+
+    for (int r = 0; r < role_count; r++) {
+        if (required[r] && out_offset[r] == IO_ROLE_NONE) {
+            fprintf(stderr, "[IO] %s 缺少必需角色 '%s'（该角色缺失会使对应安全/灯效功能失效，拒绝启动）\n",
+                    tag, names[r]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// 解析地址清单（缺省 not node → 合法，*out_count = 0，由调用方决定是否补默认）
+static bool parse_addr_list(const YAML::Node &node, int base, int sig_count,
+                            int *out, int *out_count, const char *tag) {
+    *out_count = 0;
+    if (!node) return true;
+    if (!node.IsSequence()) {
+        fprintf(stderr, "[IO] %s 必须是地址数组\n", tag);
+        return false;
+    }
+    for (size_t i = 0; i < node.size(); i++) {
+        int addr = 0;
+        try {
+            addr = node[i].as<int>();
+        } catch (const std::exception &) {
+            fprintf(stderr, "[IO] %s[%zu] 必须是整数地址\n", tag, i);
+            return false;
+        }
+        if (addr < base || addr >= base + sig_count) {
+            fprintf(stderr, "[IO] %s[%zu] 地址 M%d 越界，应在 M%d ~ M%d\n",
+                    tag, i, addr, base, base + sig_count - 1);
+            return false;
+        }
+        if (*out_count >= IO_MAX_SIGNALS) {
+            fprintf(stderr, "[IO] %s 条目过多（上限 %d）\n", tag, IO_MAX_SIGNALS);
+            return false;
+        }
+        out[(*out_count)++] = addr;
+    }
+    return true;
+}
+
 // ===== IO 配置加载 =====
 bool load_io_config(const std::string &yaml_path) {
+    // 每次加载前重置运行期配置，避免上一套点表（机型切换）的残留影响
+    g_io_config_valid = false;
+    g_di_count = 0;
+    g_do_count = 0;
+    for (int r = 0; r < DI_ROLE_COUNT; r++) g_di_role_offset[r] = IO_ROLE_NONE;
+    for (int r = 0; r < DO_ROLE_COUNT; r++) g_do_role_offset[r] = IO_ROLE_NONE;
+    for (int i = 0; i < IO_MAX_SIGNALS; i++) g_do_protected[i] = false;
+    g_pause_reset_do_count = 0;
+    g_shutdown_reset_do_count = 0;
+    g_default_auto_mode = false;   // 机型切换时复位为缺省(手动)，由 di_module 段重新解析
+
     YAML::Node config;
     try {
         config = YAML::LoadFile(yaml_path);
@@ -74,7 +263,13 @@ bool load_io_config(const std::string &yaml_path) {
         if (m["slave_id"])             g_modbus_slave_id = m["slave_id"].as<int>();
         if (m["di_device_ip"])         g_di_device_ip = m["di_device_ip"].as<std::string>();
         if (m["do_device_ip"])         g_do_device_ip = m["do_device_ip"].as<std::string>();
-        if (m["integrated_device_ip"]) g_di_device_ip = g_do_device_ip = m["integrated_device_ip"].as<std::string>();
+        // integrated_device_ip 是"集成模式(单设备DI/DO共用IP)"专用字段，只在集成模式下生效。
+        // 分立模式下若仍然赋值，会把上面已解析好的 DI/DO 两个 IP 全部覆盖成同一个地址，
+        // 导致 di_device_ip / do_device_ip 形同虚设（历史问题：日志里 DI/DO 打印同一个 IP）。
+        // 注：g_io_integrated_mode 已在本代码块首行解析完成，此处判断是安全的。
+        if (m["integrated_device_ip"] && g_io_integrated_mode) {
+            g_di_device_ip = g_do_device_ip = m["integrated_device_ip"].as<std::string>();
+        }
     }
 
     // 解析 DI 模块配置
@@ -82,6 +277,29 @@ bool load_io_config(const std::string &yaml_path) {
         auto dm = config["di_module"];
         if (dm["enabled"])      g_di_module_enabled = dm["enabled"].as<bool>();
         if (dm["base_address"]) g_di_base_address = dm["base_address"].as<int>();
+        if (dm["emergency_stop_active_low"]) {
+            g_emergency_stop_active_low = dm["emergency_stop_active_low"].as<bool>();
+        }
+        // IO 控模式(CONTROL_SOURCE_IO=1)下、手自动按钮角色未配置时的默认模式。
+        // 只允许 auto / manual，非法值按契约风格 fail-fast（避免静默用错默认值）。
+        if (dm["default_operation_mode"]) {
+            std::string mode;
+            try {
+                mode = dm["default_operation_mode"].as<std::string>();
+            } catch (const std::exception &) {
+                fprintf(stderr, "[IO] di_module.default_operation_mode 必须是字符串(auto|manual)\n");
+                return false;
+            }
+            if (mode == "auto") {
+                g_default_auto_mode = true;
+            } else if (mode == "manual") {
+                g_default_auto_mode = false;
+            } else {
+                fprintf(stderr, "[IO] di_module.default_operation_mode 非法: '%s'（只允许 auto / manual）\n",
+                        mode.c_str());
+                return false;
+            }
+        }
     }
 
     // 解析 DO 模块配置
@@ -89,46 +307,188 @@ bool load_io_config(const std::string &yaml_path) {
         auto dm = config["do_module"];
         if (dm["enabled"])      g_do_module_enabled = dm["enabled"].as<bool>();
         if (dm["base_address"]) g_do_base_address = dm["base_address"].as<int>();
+        if (dm["reset_confirm_ms"]) g_reset_confirm_ms = dm["reset_confirm_ms"].as<int>();
     }
 
-    // 解析 DI 信号地址表
+    // 解析 DI 信号地址表（契约 C1/C2：条数 1~IO_MAX_SIGNALS，且 address - base == 下标）
     if (config["di_signals"]) {
         auto signals = config["di_signals"];
-        if (signals.size() < (size_t)DI_SIGNAL_COUNT) {
-            fprintf(stderr, "DI信号数量不足: yaml有%zu个, 需要%d个\n", signals.size(), DI_SIGNAL_COUNT);
+        if (signals.size() == 0 || signals.size() > (size_t)IO_MAX_SIGNALS) {
+            fprintf(stderr, "[IO] di_signals 条数非法: %zu（允许 1~%d）\n",
+                    signals.size(), IO_MAX_SIGNALS);
             return false;
         }
-        for (size_t i = 0; i < (size_t)DI_SIGNAL_COUNT; i++) {
-            g_di_signal_addresses[i] = signals[i]["address"].as<int>();
+        for (size_t i = 0; i < signals.size(); i++) {
+            int addr = 0;
+            try {
+                addr = signals[i]["address"].as<int>();
+            } catch (const std::exception &) {
+                fprintf(stderr, "[IO] di_signals[%zu].address 缺失或非整数\n", i);
+                return false;
+            }
+            if (addr - g_di_base_address != (int)i) {
+                fprintf(stderr, "[IO] 契约C2 违反: di_signals[%zu].address=M%d，期望 M%d "
+                                "（数组必须按 address 升序，使「下标 == address - base_address」）\n",
+                        i, addr, g_di_base_address + (int)i);
+                return false;
+            }
+            g_di_signal_addresses[i] = addr;
         }
+        g_di_count = (int)signals.size();
     } else {
         fprintf(stderr, "YAML中未找到 'di_signals' 节点\n");
         return false;
     }
 
-    // 解析 DO 信号地址表
+    // 解析 DO 信号地址表（同 C1/C2）
     if (config["do_signals"]) {
         auto signals = config["do_signals"];
-        if (signals.size() < (size_t)DO_SIGNAL_COUNT) {
-            fprintf(stderr, "DO信号数量不足: yaml有%zu个, 需要%d个\n", signals.size(), DO_SIGNAL_COUNT);
+        if (signals.size() == 0 || signals.size() > (size_t)IO_MAX_SIGNALS) {
+            fprintf(stderr, "[IO] do_signals 条数非法: %zu（允许 1~%d）\n",
+                    signals.size(), IO_MAX_SIGNALS);
             return false;
         }
-        for (size_t i = 0; i < (size_t)DO_SIGNAL_COUNT; i++) {
-            g_do_signal_addresses[i] = signals[i]["address"].as<int>();
+        for (size_t i = 0; i < signals.size(); i++) {
+            int addr = 0;
+            try {
+                addr = signals[i]["address"].as<int>();
+            } catch (const std::exception &) {
+                fprintf(stderr, "[IO] do_signals[%zu].address 缺失或非整数\n", i);
+                return false;
+            }
+            if (addr - g_do_base_address != (int)i) {
+                fprintf(stderr, "[IO] 契约C2 违反: do_signals[%zu].address=M%d，期望 M%d "
+                                "（数组必须按 address 升序，使「下标 == address - base_address」）\n",
+                        i, addr, g_do_base_address + (int)i);
+                return false;
+            }
+            g_do_signal_addresses[i] = addr;
         }
+        g_do_count = (int)signals.size();
     } else {
         fprintf(stderr, "YAML中未找到 'do_signals' 节点\n");
         return false;
     }
 
-    printf("IO配置加载成功:\n");
-    printf("  集成模式: %s\n", g_io_integrated_mode ? "是" : "否");
-    printf("  端口: %d, 从站ID: %d\n", g_modbus_port, g_modbus_slave_id);
-    printf("  DI: %s (base=M%d, %d信号, IP=%s)\n",
-           g_di_module_enabled ? "启用" : "禁用", g_di_base_address, DI_SIGNAL_COUNT, g_di_device_ip.c_str());
-    printf("  DO: %s (base=M%d, %d信号, IP=%s)\n",
-           g_do_module_enabled ? "启用" : "禁用", g_do_base_address, DO_SIGNAL_COUNT, g_do_device_ip.c_str());
+    // 解析角色表（契约 C3/C4）
+    if (!parse_roles(config["di_roles"], kDiRoleNames, DI_ROLE_COUNT, kDiRoleRequired,
+                     g_di_base_address, g_di_count, g_di_role_offset, "di_roles")) {
+        return false;
+    }
+    if (!parse_roles(config["do_roles"], kDoRoleNames, DO_ROLE_COUNT, kDoRoleRequired,
+                     g_do_base_address, g_do_count, g_do_role_offset, "do_roles")) {
+        return false;
+    }
 
+    // 解析 safety 段
+    {
+        YAML::Node safety = config["safety"];
+        if (safety) {
+            if (!parse_addr_list(safety["pause_reset_do"], g_do_base_address, g_do_count,
+                                 g_pause_reset_do, &g_pause_reset_do_count,
+                                 "safety.pause_reset_do")) {
+                return false;
+            }
+            if (!parse_addr_list(safety["shutdown_reset_do"], g_do_base_address, g_do_count,
+                                 g_shutdown_reset_do, &g_shutdown_reset_do_count,
+                                 "safety.shutdown_reset_do")) {
+                return false;
+            }
+            int protect[IO_MAX_SIGNALS];
+            int protect_count = 0;
+            if (!parse_addr_list(safety["protected_do"], g_do_base_address, g_do_count,
+                                 protect, &protect_count, "safety.protected_do")) {
+                return false;
+            }
+            for (int i = 0; i < protect_count; i++) {
+                g_do_protected[protect[i] - g_do_base_address] = true;
+            }
+        }
+    }
+
+    // shutdown_reset_do 缺省 = 复位全部（[base, base+count)）
+    if (g_shutdown_reset_do_count == 0) {
+        for (int i = 0; i < g_do_count; i++) {
+            g_shutdown_reset_do[i] = g_do_base_address + i;
+        }
+        g_shutdown_reset_do_count = g_do_count;
+    }
+
+    // protected_do 缺省 = 三个按钮灯角色所在的位
+    {
+        bool any = false;
+        for (int i = 0; i < IO_MAX_SIGNALS; i++) {
+            if (g_do_protected[i]) { any = true; break; }
+        }
+        if (!any) {
+            const DoRole lights[3] = {
+                DO_ROLE_START_BUTTON_LIGHT, DO_ROLE_RESET_BUTTON_LIGHT, DO_ROLE_PAUSE_BUTTON_LIGHT
+            };
+            for (int k = 0; k < 3; k++) {
+                const int off = g_do_role_offset[lights[k]];
+                if (off >= 0 && off < IO_MAX_SIGNALS) {
+                    g_do_protected[off] = true;
+                }
+            }
+        }
+    }
+
+    // 缺省与摘要打印
+    printf("IO配置加载成功 (文件: %s):\n", yaml_path.c_str());
+    printf("  集成模式: %s | 端口: %d | 从站ID: %d\n",
+           g_io_integrated_mode ? "是" : "否", g_modbus_port, g_modbus_slave_id);
+    printf("  DI: %s (base=M%d, %d点, IP=%s)\n",
+           g_di_module_enabled ? "启用" : "禁用", g_di_base_address,
+           g_di_count, g_di_device_ip.c_str());
+    printf("      ");
+    for (int r = 0; r < DI_ROLE_COUNT; r++) {
+        const int off = g_di_role_offset[r];
+        if (off >= 0) {
+            printf("%s=位%d ", kDiRoleNames[r], off);
+        }
+    }
+    printf("\n");
+    printf("  DO: %s (base=M%d, %d点, IP=%s)\n",
+           g_do_module_enabled ? "启用" : "禁用", g_do_base_address,
+           g_do_count, g_do_device_ip.c_str());
+    printf("      ");
+    for (int r = 0; r < DO_ROLE_COUNT; r++) {
+        const int off = g_do_role_offset[r];
+        if (off >= 0) {
+            printf("%s=位%d ", kDoRoleNames[r], off);
+        }
+    }
+    printf("\n");
+    printf("  急停极性: %s | 复位确认: %dms\n",
+           g_emergency_stop_active_low ? "低电平有效(正常=高)" : "高电平有效(正常=低)",
+           g_reset_confirm_ms);
+    // IO 控模式(CONTROL_SOURCE_IO=1)下手自动来源：角色已配置→按 DI 电平；未配置→按默认模式
+    printf("  手自动按钮角色: %s", g_di_role_offset[DI_ROLE_MANUAL_AUTO_BUTTON] >= 0
+                                       ? "已配置(高=自动/低=手动)"
+                                       : "未配置");
+    if (g_di_role_offset[DI_ROLE_MANUAL_AUTO_BUTTON] < 0) {
+        printf(" | IO控默认模式: %s", g_default_auto_mode ? "自动" : "手动");
+    }
+    printf("\n");
+
+    printf("  暂停复位DO(%d): ", g_pause_reset_do_count);
+    for (int i = 0; i < g_pause_reset_do_count; i++) printf("M%d ", g_pause_reset_do[i]);
+    if (g_pause_reset_do_count == 0) {
+        printf("<未配置，暂停时不复位任何DO>");
+        fprintf(stderr, "[IO] WARN: safety.pause_reset_do 未配置，暂停时不会复位任何 DO\n");
+    }
+    printf("\n");
+    printf("  关闭复位DO(%d): M%d ~ M%d\n", g_shutdown_reset_do_count,
+           g_shutdown_reset_do_count > 0 ? g_shutdown_reset_do[0] : 0,
+           g_shutdown_reset_do_count > 0 ? g_shutdown_reset_do[g_shutdown_reset_do_count - 1] : 0);
+
+    printf("  保护DO(禁止外部写): ");
+    for (int i = 0; i < IO_MAX_SIGNALS; i++) {
+        if (g_do_protected[i]) printf("M%d ", g_do_base_address + i);
+    }
+    printf("\n");
+
+    g_io_config_valid = true;
     return true;
 }
 
@@ -138,24 +498,16 @@ static void refresh_do_state_from_device() {
     modbus_t *ctx = get_do_ctx();
     if (!ctx) return;
 
-    uint8_t do_values[16];
-    if (modbus_read_bits(ctx, 0, 16, do_values) == 16) {
-        current_do_state.start_button_light  = do_values[0];   // M800 语义名
-        current_do_state.reset_button_light  = do_values[1];   // M801
-        current_do_state.pause_button_light  = do_values[2];   // M802
-        current_do_state.buzzer              = do_values[3];   // M803
-        current_do_state.red_light           = do_values[4];   // M804
-        current_do_state.yellow_light        = do_values[5];   // M805
-        current_do_state.green_light         = do_values[6];   // M806
-        current_do_state.do_M807             = do_values[7];   // M807 通用
-        current_do_state.do_M808             = do_values[8];   // M808
-        current_do_state.do_M809             = do_values[9];   // M809
-        current_do_state.do_M810             = do_values[10];  // M810
-        current_do_state.do_M811             = do_values[11];  // M811
-        current_do_state.do_M812             = do_values[12];  // M812
-        current_do_state.do_M813             = do_values[13];  // M813
-        current_do_state.do_M814             = do_values[14];  // M814
-        current_do_state.do_M815             = do_values[15];  // M815
+    // 按实际点数读取（下标 = 位偏移），再按角色表回填语义字段
+    if (g_do_count <= 0) return;
+
+    uint8_t do_values[IO_MAX_SIGNALS] = {0};
+    if (modbus_read_bits(ctx, 0, g_do_count, do_values) == g_do_count) {
+        for (int i = 0; i < g_do_count; i++) {
+            current_do_state.raw[i] = do_values[i];
+        }
+        current_do_state.count = g_do_count;
+        apply_do_semantics_from_raw();
     } else {
         fprintf(stderr, "刷新DO状态失败: %s\n", modbus_strerror(errno));
     }
@@ -219,7 +571,7 @@ int init_modbus_interface(const char* di_ip, int di_port, int di_slave_id,
                 }
             }
         } else {
-            printf("DI模块已禁用，跳过DI设备连接\n");
+            printf("DI模块已禁用(或未提供IP)，跳过DI设备连接\n");
         }
 
         // 初始化 DO 连接
@@ -242,8 +594,12 @@ int init_modbus_interface(const char* di_ip, int di_port, int di_slave_id,
                     refresh_do_state_from_device();
                 }
             }
+        } else if (result != 0) {
+            // 注意：这里的第二条件 result==0 会让"DI 连接失败"也走到本分支，
+            // 历史日志因此误报为"DO模块已禁用"，排查时极易被带偏，故分开提示。
+            printf("DO设备连接跳过：DI连接失败（见上方 DI 连接错误）\n");
         } else {
-            printf("DO模块已禁用，跳过DO设备连接\n");
+            printf("DO模块已禁用(或未提供IP)，跳过DO设备连接\n");
         }
 
         if (result == 0) {
@@ -279,8 +635,16 @@ void cleanup_modbus_interface() {
 // ===== DI 信号读取 =====
 DI_Interface read_all_di_signals() {
     DI_Interface di = {0};
+    di.count = g_di_count;
 
-    if (!g_di_module_enabled) return di;
+    if (!g_di_module_enabled) {
+        // 无硬件联调模式（DI模块禁用）：返回"安全默认电平"而非全0。
+        // 急停必须模拟为"正常"，否则 di.emergency_stop 恒为 false，
+        // 系统会被永久判定为急停激活，导致 update_button_lights 拦截启动按钮
+        // （含虚拟启动）且红灯常亮。其余信号保持"未触发"。
+        di.emergency_stop = true;
+        return di;
+    }
 
     std::lock_guard<std::mutex> lock(get_di_mutex());
     modbus_t *ctx = get_di_ctx();
@@ -289,111 +653,46 @@ DI_Interface read_all_di_signals() {
         return di;
     }
 
-    uint8_t di_values[DI_SIGNAL_COUNT];
-    int rc = modbus_read_input_bits(ctx, 0, DI_SIGNAL_COUNT, di_values);
+    // 保留上次有效DI状态：读取失败时返回旧值而非全0，
+    // 避免瞬态Modbus错误被误判为"按钮全部释放/急停未触发"
+    static DI_Interface last_valid_di = {0};
+
+    if (g_di_count <= 0) {
+        return di;
+    }
+
+    uint8_t di_values[IO_MAX_SIGNALS] = {0};
+    int rc = modbus_read_input_bits(ctx, 0, g_di_count, di_values);
 
     if (rc == -1) {
         static int error_count = 0;
         if (error_count++ % 100 == 0) {
-            fprintf(stderr, "读取DI失败: %s (已抑制%d次重复错误)\n",
+            fprintf(stderr, "读取DI失败: %s (已抑制%d次重复错误，保留上次有效状态)\n",
                     modbus_strerror(errno), error_count);
         }
-        return di;
+        return last_valid_di;
     } else {
         static int error_count = 0;
         error_count = 0;
     }
 
-    // 映射到结构体（按字段顺序，索引即偏移量，地址由YAML配置决定）
-    di.start_button            = di_values[0];   // M500 语义名
-    di.reset_button            = di_values[1];   // M501
-    di.pause_button            = di_values[2];   // M502
-    di.manual_auto_button      = di_values[3];   // M503
-    di.emergency_stop          = di_values[4];   // M504
-    di.air_supply              = di_values[5];   // M505
-    di.di_M506                 = di_values[6];   // M506 通用
-    di.di_M507                 = di_values[7];   // M507
-    di.di_M508                 = di_values[8];   // M508
-    di.di_M509                 = di_values[9];   // M509
-    di.di_M510                 = di_values[10];  // M510
-    di.di_M511                 = di_values[11];  // M511
-    di.di_M512                 = di_values[12];  // M512
-    di.di_M513                 = di_values[13];  // M513
-    di.di_M514                 = di_values[14];  // M514
-    di.di_M515                 = di_values[15];  // M515
+    // 映射：raw[] 直接承载"设备位"（下标 = 位偏移），
+    // 语义字段由角色表（di_roles）给出，与位置彻底解耦
+    for (int i = 0; i < g_di_count; i++) {
+        di.raw[i] = di_values[i];
+    }
+    di.count              = g_di_count;
+    di.emergency_stop     = di_role_value(di, DI_ROLE_EMERGENCY_STOP);
+    di.start_button       = di_role_value(di, DI_ROLE_START_BUTTON);
+    di.reset_button       = di_role_value(di, DI_ROLE_RESET_BUTTON);
+    di.pause_button       = di_role_value(di, DI_ROLE_PAUSE_BUTTON);
+    di.manual_auto_button = di_role_value(di, DI_ROLE_MANUAL_AUTO_BUTTON);
 
+    last_valid_di = di;
     return di;
 }
 
-bool read_single_di_signal(int di_address) {
-    if (!g_di_module_enabled) return false;
-
-    std::lock_guard<std::mutex> lock(get_di_mutex());
-    modbus_t *ctx = get_di_ctx();
-    if (!ctx) return false;
-
-    // 验证地址是否在配置的信号地址表中
-    bool valid = false;
-    for (int i = 0; i < DI_SIGNAL_COUNT; i++) {
-        if (g_di_signal_addresses[i] == di_address) { valid = true; break; }
-    }
-    if (!valid) {
-        fprintf(stderr, "DI地址不在配置范围内: M%d\n", di_address);
-        return false;
-    }
-
-    uint8_t value;
-    int rc = modbus_read_input_bits(ctx, di_address - g_di_base_address, 1, &value);
-    return (rc == 1) ? value : false;
-}
-
 // ===== DO 信号写入 =====
-int write_do_signals(DO_Interface do_signals) {
-    if (!g_do_module_enabled) {
-        fprintf(stderr, "警告: DO模块已禁用，无法写入信号\n");
-        return -1;
-    }
-
-    std::lock_guard<std::mutex> lock(get_do_mutex());
-    modbus_t *ctx = get_do_ctx();
-    if (!ctx) return -1;
-
-    // 先读取当前所有DO状态，避免清除其他位
-    uint8_t do_values[16];
-    if (modbus_read_bits(ctx, 0, 16, do_values) != 16) {
-        fprintf(stderr, "读取当前DO状态失败\n");
-        return -1;
-    }
-
-    // 设置DO值（偏移量 = 地址 - g_do_base_address）
-    do_values[0]  = do_signals.start_button_light;   // M800
-    do_values[1]  = do_signals.reset_button_light;   // M801
-    do_values[2]  = do_signals.pause_button_light;   // M802
-    do_values[3]  = do_signals.buzzer;               // M803
-    do_values[4]  = do_signals.red_light;            // M804
-    do_values[5]  = do_signals.yellow_light;         // M805
-    do_values[6]  = do_signals.green_light;          // M806
-    do_values[7]  = do_signals.do_M807;              // M807
-    do_values[8]  = do_signals.do_M808;              // M808
-    do_values[9]  = do_signals.do_M809;              // M809
-    do_values[10] = do_signals.do_M810;              // M810
-    do_values[11] = do_signals.do_M811;              // M811
-    do_values[12] = do_signals.do_M812;              // M812
-    do_values[13] = do_signals.do_M813;              // M813
-    do_values[14] = do_signals.do_M814;              // M814
-    do_values[15] = do_signals.do_M815;              // M815
-
-    // 写入设备
-    int result = modbus_write_bits(ctx, 0, 16, do_values);
-
-    // 写入后刷新状态缓存
-    if (result == 16) {
-        refresh_do_state_from_device();
-    }
-
-    return result;
-}
-
 int write_single_do_signal(int do_address, bool state) {
     if (!g_do_module_enabled) {
         fprintf(stderr, "警告: DO模块已禁用，无法写入信号\n");
@@ -404,43 +703,43 @@ int write_single_do_signal(int do_address, bool state) {
     modbus_t *ctx = get_do_ctx();
     if (!ctx) return -1;
 
-    // 验证地址是否在配置的信号地址表中
+    // 验证地址是否在配置的信号地址表中（契约 C2 保证 address == base + 位偏移）
     bool valid = false;
-    for (int i = 0; i < DO_SIGNAL_COUNT; i++) {
+    for (int i = 0; i < g_do_count; i++) {
         if (g_do_signal_addresses[i] == do_address) { valid = true; break; }
     }
     if (!valid) {
-        fprintf(stderr, "DO地址不在配置范围内: M%d\n", do_address);
+        fprintf(stderr, "DO地址不在配置范围内: M%d（范围 M%d ~ M%d）\n",
+                do_address, g_do_base_address, g_do_base_address + g_do_count - 1);
         return -1;
     }
 
     // 写入单个信号到设备
     int result = modbus_write_bit(ctx, do_address - g_do_base_address, state);
 
-    // 写入成功后刷新DO状态缓存
-    if (result == 1) {
-        uint8_t do_values[16];
-        if (modbus_read_bits(ctx, 0, 16, do_values) == 16) {
-            current_do_state.start_button_light  = do_values[0];
-            current_do_state.reset_button_light  = do_values[1];
-            current_do_state.pause_button_light  = do_values[2];
-            current_do_state.buzzer              = do_values[3];
-            current_do_state.red_light           = do_values[4];
-            current_do_state.yellow_light        = do_values[5];
-            current_do_state.green_light         = do_values[6];
-            current_do_state.do_M807             = do_values[7];
-            current_do_state.do_M808             = do_values[8];
-            current_do_state.do_M809             = do_values[9];
-            current_do_state.do_M810             = do_values[10];
-            current_do_state.do_M811             = do_values[11];
-            current_do_state.do_M812             = do_values[12];
-            current_do_state.do_M813             = do_values[13];
-            current_do_state.do_M814             = do_values[14];
-            current_do_state.do_M815             = do_values[15];
+    // 写入成功后刷新DO状态缓存（按实际点数回读，再按角色表回填语义字段）
+    if (result == 1 && g_do_count > 0) {
+        uint8_t do_values[IO_MAX_SIGNALS] = {0};
+        if (modbus_read_bits(ctx, 0, g_do_count, do_values) == g_do_count) {
+            for (int i = 0; i < g_do_count; i++) {
+                current_do_state.raw[i] = do_values[i];
+            }
+            current_do_state.count = g_do_count;
+            apply_do_semantics_from_raw();
         }
     }
 
     return result;
+}
+
+// 按角色写 DO：角色未配置（IO_ROLE_NONE）时返回 -1，不做任何写入
+int write_do_role(DoRole role, bool state) {
+    if (role < 0 || role >= DO_ROLE_COUNT) return -1;
+    const int off = g_do_role_offset[role];
+    if (off < 0) {
+        return -1;   // 该角色在本机型的 do_roles 中未配置
+    }
+    return write_single_do_signal(g_do_base_address + off, state);
 }
 
 // ===== DO 状态获取 =====
@@ -465,16 +764,6 @@ bool is_do_module_enabled() {
     return g_do_module_enabled;
 }
 
-// ===== 非阻塞延时检查 =====
-int should_execute_sequence(time_t *last_time, int interval_seconds) {
-    time_t current_time = time(NULL);
-    if (current_time - *last_time >= interval_seconds) {
-        *last_time = current_time;
-        return 1;
-    }
-    return 0;
-}
-
 // ===== DO 控制命令解析 =====
 bool parse_do_control_command(const std::string& command, DOControlCommand& do_cmd) {
     // 格式: "801:1" 或 "801:0"
@@ -497,12 +786,12 @@ bool parse_do_control_command(const std::string& command, DOControlCommand& do_c
     try {
         int address = std::stoi(addr_str);
         bool valid = false;
-        for (int i = 0; i < DO_SIGNAL_COUNT; i++) {
+        for (int i = 0; i < g_do_count; i++) {
             if (g_do_signal_addresses[i] == address) { valid = true; break; }
         }
         if (!valid) {
             fprintf(stderr, "DO地址不在配置范围内: M%d (范围M%d~M%d)\n",
-                    address, g_do_base_address, g_do_base_address + DO_SIGNAL_COUNT - 1);
+                    address, g_do_base_address, g_do_base_address + g_do_count - 1);
             return false;
         }
         do_cmd.do_address = addr_str;

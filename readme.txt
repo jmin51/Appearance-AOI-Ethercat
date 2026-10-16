@@ -53,3 +53,51 @@ chmod +x ~/dev_ws/launch_qt_hmi.sh
 cp ~/dev_ws/qt_hmi.desktop ~/桌面/
 
 # 3. 右键桌面上的 qt_hmi.desktop → "允许启动"（Allow Launching）
+
+------------------日志管理（logrotate）配置----------------------
+1. 创建 logrotate 配置文件
+sudo tee /etc/logrotate.d/aoi > /dev/null <<'EOF'
+/home/jmin/ros2_launch_logs/aoi.log {
+    daily
+    rotate 10
+    missingok
+    notifempty
+    copytruncate
+    dateext
+    dateyesterday
+    extension .log
+    compress
+    delaycompress
+}
+EOF
+
+2. 配置参数说明
+# daily          每天午夜 00:00 无条件切一次（不管大小）
+# rotate 10      只保留最近 10 份归档，第 11 份自动删除
+# missingok      没有日志文件时不报错
+# notifempty     空文件不轮转
+# copytruncate   复制后清空原文件，进程不用重启（必须保留）
+# dateext        归档名带日期
+# dateyesterday  归档名用昨天的日期（与归档内日志时间戳对齐，消除午夜切分的一天偏移）
+# extension .log 让 .log 后缀保持在末尾，归档名为 aoi-20260909.log
+# compress       压缩旧归档为 .gz
+# delaycompress  延迟一个周期再压缩（最新一份归档先不压）
+# 说明：若要"满 200M 才切"而不是每天切，把 daily 换成 size 200M 即可
+
+3. 验证
+sudo logrotate -d /etc/logrotate.d/aoi   # 调试模式，只模拟不落盘
+sudo logrotate -f /etc/logrotate.d/aoi   # 强制切一次实测
+ls -lh /home/jmin/ros2_launch_logs/      # 查看归档结果
+
+4. 自动执行说明
+# logrotate 靠系统定时任务每天跑一次，本机为 systemd 的 logrotate.timer，
+# 每天午夜 00:00 触发（OnCalendar=daily）
+# 查看定时器：systemctl list-timers | grep -i logrotate
+# 注意：若 /etc/cron.daily/logrotate 也存在会重复跑，可执行
+#       sudo rm /etc/cron.daily/logrotate  只保留 timer 一个源
+
+5. 需要改的地方（按需修改）
+# 日志目录/文件名：/home/jmin/ros2_launch_logs/aoi.log 按实际环境替换
+# 用户名与家目录：jmin、/home/jmin 按实际用户替换
+# 切分方式：daily（每天切）/ size 200M（满 200M 切）
+# 保留份数：rotate 后的数字

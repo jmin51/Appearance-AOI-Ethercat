@@ -54,6 +54,7 @@ private:
 
     int leisai_specific_param_;
     uint32_t product_code_;  // 存储实际使用的产品号
+    unsigned int homing_wait_counter_ = 0;  // 等回原达标期间的告警节流计数（仅实时线程访问）
 };
 
 #endif // LEISAI_SERVO_AXIS_HPP

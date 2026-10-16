@@ -14,7 +14,7 @@ set -e
 LOG_DIR="$HOME/ros2_launch_logs"
 mkdir -p "$LOG_DIR"
 
-LOG_FILE="$LOG_DIR/aoi_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="$LOG_DIR/aoi.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "========================================"

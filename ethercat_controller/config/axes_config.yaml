@@ -34,6 +34,8 @@ servo_axes:
     product_code: 0x000c0112
     gear_ratio: 1.0
     calc_mode: "DISPLACEMENT"
+    # 回原轴：复位按钮按下时该轴切换为 HM 回原模式，其余情况为 CSP
+    operation_mode: "homing"
     jog_speed: 20.0
     min_jog_speed: 1.0
     max_jog_speed: 100.0
@@ -88,6 +90,18 @@ servo_axes:
     calc_mode: "ANGLE"
     jog_speed: 10.0
     min_jog_speed: 1.0
-    max_jog_speed: 200.0
+    max_jog_speed: 100.0
     auto_speed: 20.0
+    # 自动模式梯形速度曲线（旋转台专用：比线性轴更柔和，减小回转冲击与线缆牵扯）
+    # 200 °/s² 换算为 0.6 脉冲/周期²，各速度下斜坡时间：
+    #   工作速度 20 °/s(auto_speed) → 0.10s (100 周期)，加减速距离各 1.0°
+    #   30% 速度 30 °/s            → 0.15s，加减速距离各 2.25°
+    #   满速   100 °/s(max_jog)    → 0.50s，加减速距离各 25°
+    # 现场如需调整：把 accel/decel 同比例放大/缩小即可（如都填 400.0 即等于系统默认值）
+    accel: 200.0
+    decel: 200.0
+    # 角度软限位（仅角度模式轴有效，单位：度）
+    # 目标角度超出此范围时自动钳制，可防止机械碰撞或线缆缠绕
+    min_angle: -1200.0
+    max_angle: 1200.0
 

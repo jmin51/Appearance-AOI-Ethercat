@@ -1,5 +1,18 @@
-# IO 模块配置文件
-# 所有IP、端口、模式开关、信号地址映射均在此配置，无需重新编译
+# ============================================================================
+# IO 模块配置模板 —— 老机型（双设备/16点，历史机型）
+# ----------------------------------------------------------------------------
+# 【使用方式】
+#   本文件是"机型模板"，不参与运行；生效文件固定为 config/io_config.yaml。
+#   切换机型：cp config/models/io_config_legacy.yaml config/io_config.yaml 后重新 build。
+#
+# 【与圣白机型的差别】
+#   老机型位序：位0=启动、位1=复位、位2=暂停、位3=手自动、位4=急停、位5=气源；
+#               DO 位0=启动灯、位1=复位灯、位2=暂停灯、位3=蜂鸣器、位4=红、位5=黄、位6=绿。
+#   该差异全部由下方 di_roles / do_roles 吸收，代码无需区分机型。
+#
+# 【契约与编号约定】见 io_config_shengbai.yaml 头部说明
+#   DI{n} 的 n = 位偏移（= address - base_address），DI 位0 = M500 ...
+# ============================================================================
 
 modbus:
   integrated_mode: true       # true=单设备集成(DO+DI同一IP), false=双设备分立
@@ -7,61 +20,94 @@ modbus:
   slave_id: 1                 # Modbus 从站ID
   di_device_ip: "192.168.1.84"    # 分立模式下DI设备IP
   do_device_ip: "192.168.1.84"    # 分立模式下DO设备IP
-  integrated_device_ip: "192.168.1.84"  # 集成模式下共用IP
+  integrated_device_ip: "192.168.1.84"  # 仅 integrated_mode=true 时生效
 
 di_module:
-  enabled: true               # 是否启用DI模块
+  enabled: true              # 对接实体IO模块时改为 true
   base_address: 500           # DI起始Modbus地址
+  emergency_stop_active_low: true   # 急停极性：true=低电平有效(正常时高电平)
+  # IO 控模式(CONTROL_SOURCE_IO=1)下、手自动按钮角色未配置时的默认模式（auto|manual）
+  # 本机型有实体手自动按钮（di_roles.manual_auto_button=503），此项不生效；
+  # 留作机型切换/无按钮时的兜底，缺省 manual
+  # default_operation_mode: "auto"
 
 do_module:
-  enabled: true               # 是否启用DO模块
+  enabled: true              # 对接实体IO模块时改为 true
   base_address: 800           # DO起始Modbus地址
+  reset_confirm_ms: 3000      # 复位按钮长按确认时长（ms）
+
+# ============================================================================
+# 语义角色绑定（必需角色缺失 → 拒绝启动；可选角色未配置 → 恒 false）
+# ============================================================================
+di_roles:
+  start_button: 500           # 位0
+  reset_button: 501           # 位1
+  pause_button: 502           # 位2
+  manual_auto_button: 503     # 位3（可选角色，本机型有）
+  emergency_stop: 504         # 位4
+
+do_roles:
+  start_button_light: 800     # 位0
+  reset_button_light: 801     # 位1
+  pause_button_light: 802     # 位2
+  buzzer: 803                 # 位3
+  red_light: 804              # 位4
+  yellow_light: 805           # 位5
+  green_light: 806            # 位6
+
+# ============================================================================
+# 安全相关 DO 清单（老机型工艺执行器在 M807~M815，暂停仅复位皮带相关 4 路）
+#   shutdown_reset_do 缺省 = 全部（M800 ~ M815）
+#   protected_do      缺省 = [800, 801, 802]（三个按钮灯）
+# ============================================================================
+safety:
+  pause_reset_do: []
 
 # ============================================================
-# DI 输入信号定义（字段顺序必须与 DI_Interface 结构体一致）
-# M500 ~ M515 (共16个, 前5个固定语义, 后11个通用)
+# DI 输入信号定义（16 条，M500 ~ M515）
+# 顺序必须按 address 升序（下标 = 位偏移）
 # ============================================================
 di_signals:
-  - name: "start_button"           # M500  启动按钮 (语义)
+  - name: "start_button"           # M500 位0  语义
     address: 500
     desc: "启动按钮"
-  - name: "reset_button"           # M501  复位按钮 (语义)
+  - name: "reset_button"           # M501 位1  语义
     address: 501
     desc: "复位按钮"
-  - name: "pause_button"           # M502  暂停按钮 (语义)
+  - name: "pause_button"           # M502 位2  语义
     address: 502
     desc: "暂停按钮"
-  - name: "manual_auto_button"     # M503  手自动按钮 (语义)
+  - name: "manual_auto_button"     # M503 位3  语义
     address: 503
     desc: "手自动按钮"
-  - name: "emergency_stop"          # M504  急停按钮 (语义)
+  - name: "emergency_stop"         # M504 位4  语义
     address: 504
     desc: "急停按钮"
-  - name: "safety_door_1"           # M505  安全门检测1
+  - name: "air_supply"             # M505 位5  语义
     address: 505
-    desc: "安全门检测1"
-  - name: "safety_door_2"           # M506  安全门检测2
+    desc: "气源输入"
+  - name: "safety_door_1"          # M506
     address: 506
-    desc: "安全门检测2"
-  - name: "safety_door_3"           # M507  安全门检测3
+    desc: "安全门检测1"
+  - name: "safety_door_2"          # M507
     address: 507
-    desc: "安全门检测3"
+    desc: "安全门检测2"
   - name: "di_M508"                # M508  预留
     address: 508
     desc: "预留"
   - name: "di_M509"                # M509  预留
     address: 509
     desc: "预留"
-  - name: "safety_door_4"           # M510  安全门检测4
+  - name: "safety_door_3"          # M510
     address: 510
-    desc: "安全门检测4"
-  - name: "safety_door_5"           # M511  安全门检测5
+    desc: "安全门检测3"
+  - name: "safety_door_4"          # M511
     address: 511
-    desc: "安全门检测5"
-  - name: "light_curtain_1"        # M512  光栅1检测
+    desc: "安全门检测4"
+  - name: "light_curtain_1"        # M512
     address: 512
     desc: "光栅1检测"
-  - name: "light_curtain_2"        # M513  光栅2检测
+  - name: "light_curtain_2"        # M513
     address: 513
     desc: "光栅2检测"
   - name: "di_M514"                # M514  预留
@@ -72,41 +118,41 @@ di_signals:
     desc: "预留"
 
 # ============================================================
-# DO 输出信号定义（字段顺序必须与 DO_Interface 结构体一致）
-# M800 ~ M815 (共16个, 前7个固定语义, 后9个通用)
+# DO 输出信号定义（16 条，M800 ~ M815）
+# 顺序必须按 address 升序（下标 = 位偏移）
 # ============================================================
 do_signals:
-  - name: "start_button_light"     # M800  启动按钮灯 (语义)
+  - name: "start_button_light"     # M800 位0  语义
     address: 800
     desc: "启动按钮灯"
-  - name: "reset_button_light"     # M801  复位按钮灯 (语义)
+  - name: "reset_button_light"     # M801 位1  语义
     address: 801
     desc: "复位按钮灯"
-  - name: "pause_button_light"    # M802  暂停按钮灯 (语义)
+  - name: "pause_button_light"     # M802 位2  语义
     address: 802
     desc: "暂停按钮灯"
-  - name: "buzzer"                # M803  蜂鸣器 (语义)
+  - name: "buzzer"                 # M803 位3  语义
     address: 803
     desc: "蜂鸣器"
-  - name: "red_light"             # M804  三色红灯 (语义)
+  - name: "red_light"              # M804 位4  语义
     address: 804
     desc: "三色红灯"
-  - name: "yellow_light"          # M805  三色黄灯 (语义)
+  - name: "yellow_light"           # M805 位5  语义
     address: 805
     desc: "三色黄灯"
-  - name: "green_light"           # M806  三色绿灯 (语义)
+  - name: "green_light"            # M806 位6  语义
     address: 806
     desc: "三色绿灯"
-  - name: "light_source_1"        # M807  光源控制1
+  - name: "light_source_1"         # M807
     address: 807
     desc: "光源控制1"
-  - name: "light_source_2"        # M808  光源控制2
+  - name: "light_source_2"         # M808
     address: 808
     desc: "光源控制2"
-  - name: "light_source_3"        # M809  光源控制3
+  - name: "light_source_3"         # M809
     address: 809
     desc: "光源控制3"
-  - name: "light_source_4"        # M810  光源控制4
+  - name: "light_source_4"         # M810
     address: 810
     desc: "光源控制4"
   - name: "do_M811"               # M811  预留

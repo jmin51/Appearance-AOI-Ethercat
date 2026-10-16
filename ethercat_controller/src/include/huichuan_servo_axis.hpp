@@ -43,12 +43,19 @@ private:
     void handle_huichuan_homing(uint8_t* domain1_pd, int32_t current_pos);
     void handle_huichuan_manual_operation(uint8_t* domain1_pd, int32_t current_pos);
     void handle_huichuan_auto_operation(uint8_t* domain1_pd, int32_t current_pos);
+    /// 手动/自动模式共用的点动执行（速度型剖面：软起动 / 软停止 / 软换向）
+    void handle_huichuan_jog(uint8_t* domain1_pd);
+    /// 内部限位(Bit11 = 0x0800)对点动的拦截 —— 手动/自动模式共用
+    ///   仅拦"朝限位方向"的点动（硬停），反方向放行；Bit11 清除时复位方向记录
+    /// @return true 表示本次已拦截并硬停（点动标志已被消费），false 表示未拦截
+    bool intercept_jog_by_limit(uint16_t read_status_word, uint8_t* domain1_pd, int32_t current_pos);
     
     uint32_t product_code_;          // 存储实际使用的产品号
     double huichuan_specific_param_;
     // 添加缺失的成员变量
     int32_t home_target_position_;
     unsigned int init_delay_ = 0;    // 每轴独立初始化延时计数器
+    unsigned int init_stuck_counter_ = 0;  // 初始化阶段状态字无进展的周期计数（超时报警，避免静默卡死）
 };
 
 #endif // HUICHUAN_SERVO_AXIS_HPP

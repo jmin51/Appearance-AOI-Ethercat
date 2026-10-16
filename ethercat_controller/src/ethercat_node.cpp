@@ -10,7 +10,7 @@
 #include <yaml-cpp/yaml.h>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 
-#define CONTROL_SOURCE_IO 0 // 1:使用IO控制手自动模式, 0:使用话题控制
+#define CONTROL_SOURCE_IO 1 // 1:使用IO控制手自动模式, 0:使用话题控制
 // 全局变量定义
 std::shared_ptr<EthercatNode> global_node = nullptr;
 ec_master_t *master = nullptr;
@@ -21,7 +21,26 @@ std::atomic<bool> node_shutting_down_{false};
 // 全局变量定义
 std::atomic<bool> g_system_running(false);
 std::atomic<bool> g_start_button_pressed(false);
-std::atomic<bool> g_pause_button_pressed(false);
+// 硬件急停电平（true=急停按下，由 main.cpp 主循环按 DI 极性归一化后写入）
+// 与虚拟急停软件锁存 g_virtual_estop_active 严格独立，二者互不写入（见 globals.h）
+std::atomic<bool> g_hw_estop_active(false);
+// 按流程停机锁存（急停/复位回原/待启动）：用于 /system_status 基态上报 STOPPED
+std::atomic<bool> g_system_halted(false);
+// "暂停/恢复请求"（物理暂停 DI pause_button 与 Qt 虚拟暂停 VBTN_PAUSE 合并后触发）。
+// 触发源有两个，方向由 main 按 g_paused 取反判定（now_paused = !g_paused），main 无需区分来源：
+//   1) 非暂停态按下暂停按钮（上升沿）→ 请求进入暂停；
+//   2) 运行中且处于暂停态按下启动按钮（上升沿）→ 请求恢复（暂停中的暂停按钮被灯控忽略）。
+// 单独一个标志是为了不再复用"急停/复位共用"的语义（历史上二者混用会互相踩）。
+std::atomic<bool> g_pause_toggle_requested(false);
+// 暂停锁存：true=暂停中。暂停时轴被 stop() 回 READY 并驻留，IO 控模式不自动进模式；
+// **恢复由启动按钮触发**，恢复时按"话题预选 > DI 手自动位 > 默认模式"进对应模式。
+// 语义见 main.cpp 主循环的暂停分支。
+std::atomic<bool> g_paused(false);
+// 暂停期间"话题预选"的模式：0=未预选、1=手动、2=自动。
+// 暂停中收到 /control_command 的 start_manual/start_auto 只记录到这里（不立即切模式，
+// 否则暂停会被打穿：轴进模式后 is_running() 为真，位移指令就会执行）。
+// 解除暂停时优先用它（一次性，exchange(0) 读走即清），无预选才回落到 DI 手自动位/默认模式。
+std::atomic<int> g_pending_mode(0);
 std::atomic<bool> g_reset_button_pressed(false); // 复位按钮状态
 std::atomic<bool> g_full_shutdown_requested(false);       // 完整关闭请求（急停/复位触发）
 std::atomic<bool> g_reset_pending_after_estop(false);     // 复位触发的急停后待执行回原
@@ -76,26 +95,28 @@ void EthercatNode::initialize_node()
             handle_displacement_command(msg);
         });
 
-    dual_displacement_sub_ = this->create_subscription<std_msgs::msg::String>(
-        "/dual_displacement_command", rclcpp::QoS(10).reliable(),
+    // 速度百分比指令（位移轴）："轴名:目标mm:百分比"
+    displacement_pct_sub_ = this->create_subscription<std_msgs::msg::String>(
+        "/displacement_command_pct", rclcpp::QoS(10).reliable(),
         [this](const std_msgs::msg::String::SharedPtr msg)
         {
-            handle_displacement_command(msg);
+            handle_displacement_pct_command(msg);
         });
 
-    XYR_displacement_sub_ = this->create_subscription<std_msgs::msg::String>(
-        "/XYR_displacement_command", rclcpp::QoS(10).reliable(),
-        [this](const std_msgs::msg::String::SharedPtr msg)
-        {
-            handle_displacement_command(msg);
-        });
-        
     // 添加角度控制订阅器 (rad)
     angle_sub_ = this->create_subscription<std_msgs::msg::String>(
         "/angle_command", rclcpp::QoS(10).reliable(),
         [this](const std_msgs::msg::String::SharedPtr msg)
         {
             handle_angle_command(msg);
+        });
+
+    // 速度百分比指令（角度轴）："轴名:目标rad:百分比"
+    angle_pct_sub_ = this->create_subscription<std_msgs::msg::String>(
+        "/angle_command_pct", rclcpp::QoS(10).reliable(),
+        [this](const std_msgs::msg::String::SharedPtr msg)
+        {
+            handle_angle_pct_command(msg);
         });
 
     control_command_sub_ = this->create_subscription<std_msgs::msg::String>(
@@ -208,12 +229,27 @@ void EthercatNode::publish_system_status()
     }
 
     std::string status;
-    if (all_fault || any_fault)   status = "FAULT";
-    else if (all_ready)           status = "READY";
-    else if (all_manual)          status = "MANUAL";
-    else if (all_auto)            status = "AUTO";
-    else if (all_stopped)         status = "STOPPED";
-    else                          status = "INIT";
+    if (all_fault || any_fault)      status = "FAULT";       // 故障优先，保持可见性
+    else if (g_system_halted.load()) status = "STOPPED";     // 按流程停机（急停/复位回原/待启动）
+    else if (all_ready)              status = "READY";
+    else if (all_manual)             status = "MANUAL";
+    else if (all_auto)               status = "AUTO";
+    else if (all_stopped)            status = "STOPPED";
+    else                             status = "INIT";
+
+    // 后缀标记（HMI 据此显示"暂停中"/"急停中"，并实现"暂停中只能预选一次"）：
+    //   形如 "READY|PAUSED" / "STOPPED|PAUSED|ESTOP" / "FAULT|ESTOP"。HMI 用 contains 判断，不依赖顺序。
+    //   同话题其它文本（"执行命令: xxx"、点动速度提示）都不含 '|'，HMI 解析时不会误判。
+    //   注 1：ESTOP 对外是"急停中"的统一语义，来源有两个且内部严格分离：
+    //         - 虚拟急停软件锁存 g_virtual_estop_active（HMI 可 toggle 解除）
+    //         - 硬件急停电平 g_hw_estop_active（DI 驱动，松开即恢复，不可软件解除）
+    //         HMI 现有的虚拟急停按钮由该标记点亮，物理急停期间点击会被 handle_virtual_io 互锁忽略，
+    //         因此不会出现"界面说已解除、实物仍急停"的错位。
+    //   注 2：EHW 表示"硬件急停仍处于按下状态"，仅供日志/Python 等非 HMI 消费方区分来源；
+    //         命名刻意不含 "ESTOP" 子串 —— HMI 用 contains 匹配，写 ESTOP_HW 会误点亮虚拟急停按钮。
+    if (g_paused.load()) status += "|PAUSED";
+    if (is_virtual_estop_active() || g_hw_estop_active.load()) status += "|ESTOP";
+    if (g_hw_estop_active.load()) status += "|EHW";
 
     auto msg = std_msgs::msg::String();
     msg.data = status;
@@ -280,7 +316,7 @@ void EthercatNode::init_axes(ec_master_t *master)
     RCLCPP_INFO(this->get_logger(), "开始初始化伺服轴");
 
     // 清空现有轴对象，确保重新启动时初值正确
-    stop_io_monitoring(); // 等待IO线程完全退出
+    // 方案A：IO轮询由主线程执行，不再停止IO监控（保持Modbus连接跨重启可用）
     servo_axes_.clear();
     last_target_positions_.clear(); // 同时清空位置记录
 
@@ -317,6 +353,11 @@ void EthercatNode::init_axes(ec_master_t *master)
     for (auto &axis : servo_axes_)
     {
         axis->configure(master);
+    }
+    // 所有轴配置完成后统一清除复位标志（回原轴已在各自 configure() 中读取该标志）
+    if (g_reset_button_pressed.load())
+    {
+        g_reset_button_pressed.store(false);
     }
 
     // 打印每个轴的点动速度、自动速度和每转脉冲数
@@ -363,6 +404,8 @@ bool EthercatNode::load_axes_from_yaml(const std::string &yaml_path)
             uint32_t product_code = axis_cfg["product_code"] ? axis_cfg["product_code"].as<uint32_t>() : 0;
             double gear_ratio = axis_cfg["gear_ratio"] ? axis_cfg["gear_ratio"].as<double>() : 1.0;
             std::string calc_mode_str = axis_cfg["calc_mode"] ? axis_cfg["calc_mode"].as<std::string>() : "DISPLACEMENT";
+            // operation_mode: "homing" 表示该轴为回原轴（复位流程中切换为 HM 模式）
+            std::string operation_mode_str = axis_cfg["operation_mode"] ? axis_cfg["operation_mode"].as<std::string>() : "csp";
 
             DriveBrand brand = ServoAxisFactory::string_to_brand(brand_str);
             AxisType axis_type = ServoAxisFactory::string_to_axis_type(axis_type_str);
@@ -370,6 +413,13 @@ bool EthercatNode::load_axes_from_yaml(const std::string &yaml_path)
 
             auto axis = ServoAxisFactory::create_servo_axis(
                 brand, name, position, axis_type, product_code, gear_ratio, calc_mode);
+
+            // 标记回原轴（复位流程中切换为 HM 回原模式），替代原先硬编码 "axis3" 判断
+            if (operation_mode_str == "homing" || operation_mode_str == "HOMING" ||
+                operation_mode_str == "hm" || operation_mode_str == "HM") {
+                axis->set_homing_mode(true);
+                RCLCPP_INFO(this->get_logger(), "轴 %s 标记为回原轴 (operation_mode=homing)", name.c_str());
+            }
 
             // 从YAML读取速度范围（角度轴: °/s, 位移轴: mm/s）
             // 必须先设置范围，再设置点动速度，否则 set_jog_speed 会因默认范围校验失败
@@ -393,9 +443,68 @@ bool EthercatNode::load_axes_from_yaml(const std::string &yaml_path)
             // 从YAML读取自动速度并设置（角度轴: °/s, 位移轴: mm/s）
             if (axis_cfg["auto_speed"]) {
                 double auto_speed = axis_cfg["auto_speed"].as<double>();
-                axis->set_auto_speed(auto_speed);
-                RCLCPP_INFO(this->get_logger(), "轴 %s 自动速度设置为: %.1f",
-                            name.c_str(), auto_speed);
+                if (axis->set_auto_speed(auto_speed)) {
+                    RCLCPP_INFO(this->get_logger(), "轴 %s 自动速度设置为: %.1f",
+                                name.c_str(), auto_speed);
+                } else {
+                    // 非法配置必须显式上报，避免静默回落到默认值后现场"速度不对却查不到原因"
+                    RCLCPP_ERROR(this->get_logger(),
+                        "轴 %s 的 auto_speed=%.3f 非法（须在 (0, %.1f] 且每周期步长>=1），"
+                        "已保留默认值 %.1f",
+                        name.c_str(), auto_speed, axis->get_max_jog_speed(),
+                        axis->get_auto_speed());
+                }
+            }
+
+            // 从YAML读取自动模式梯形速度曲线的加减速参数
+            // 默认 4 × max_jog_speed：任何速度百分比下都能在 ~0.25s 内达到巡航速度
+            {
+                const double max_jog = axis->get_max_jog_speed();
+                const double accel = axis_cfg["accel"] ? axis_cfg["accel"].as<double>()
+                                                       : 4.0 * max_jog;
+                const double decel = axis_cfg["decel"] ? axis_cfg["decel"].as<double>()
+                                                       : accel;
+                if (axis->set_auto_profile(accel, decel)) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "轴 %s 梯形曲线: accel=%.1f, decel=%.1f (%s/s²), 达到最大速度约需 %.2fs",
+                        name.c_str(), accel, decel,
+                        calc_mode == AxisCalcMode::ANGLE ? "°" : "mm",
+                        (accel > 0.0) ? (max_jog / accel) : 0.0);
+                } else {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "轴 %s 的 accel=%.3f 非法（必须为正），已忽略；"
+                        "该轴自动模式将退回限速一步式（无加减速）",
+                        name.c_str(), accel);
+                }
+            }
+
+            // 从YAML读取手动点动软起动参数（软起动 / 软停止 / 软换向）
+            // 缺省（不配或填 0）：jog_accel = 4 × jog_speed      → 0→点动速度约 0.25s
+            //                    jog_decel = 20 × max_jog_speed  → 全速刹停 2.5~15ms，滑行小
+            if (axis_cfg["jog_accel"] || axis_cfg["jog_decel"]) {
+                const double jog_accel = axis_cfg["jog_accel"] ? axis_cfg["jog_accel"].as<double>() : 0.0;
+                const double jog_decel = axis_cfg["jog_decel"] ? axis_cfg["jog_decel"].as<double>() : 0.0;
+                if (axis->set_jog_profile(jog_accel, jog_decel)) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "轴 %s 手动点动软起动: jog_accel=%.1f, jog_decel=%.1f (%s/s²)，0 表示采用缺省",
+                        name.c_str(), jog_accel, jog_decel,
+                        calc_mode == AxisCalcMode::ANGLE ? "°" : "mm");
+                } else {
+                    RCLCPP_ERROR(this->get_logger(),
+                        "轴 %s 的 jog_accel=%.3f / jog_decel=%.3f 非法（必须为正），已忽略并沿用缺省",
+                        name.c_str(), jog_accel, jog_decel);
+                }
+            }
+
+            // 从YAML读取角度软限位（仅角度模式轴有效，单位：度）
+            // min_angle: 最小允许角度（负数表示反向限位）
+            // max_angle: 最大允许角度（正数表示正向限位）
+            if (axis_cfg["min_angle"] || axis_cfg["max_angle"]) {
+                double min_angle = axis_cfg["min_angle"] ? axis_cfg["min_angle"].as<double>() : -180.0;
+                double max_angle = axis_cfg["max_angle"] ? axis_cfg["max_angle"].as<double>() : 180.0;
+                axis->set_angle_limits(min_angle, max_angle);
+                RCLCPP_INFO(this->get_logger(), "轴 %s 角度软限位: [%.1f°, %.1f°]",
+                            name.c_str(), min_angle, max_angle);
             }
 
             servo_axes_.push_back(std::move(axis));
@@ -543,21 +652,40 @@ void EthercatNode::handle_control_command(const std::string &command)
 
     if (command == CMD_START_MANUAL)
     {
-        // 手动模式
-        for (auto &axis : servo_axes_)
+        // 暂停中只"预选"，不立即切模式：
+        //   若立即切，轴会进 MANUAL 模式 → is_running() 为真 → 位移指令照常执行，暂停被打穿；
+        //   而且解除暂停时又会按 DI 重选，操作员的选择被覆盖。
+        if (g_paused.load())
         {
-            axis->start_manual_mode();
+            g_pending_mode.store(1, std::memory_order_relaxed);
+            RCLCPP_INFO(this->get_logger(), "暂停中，已预选手动模式（解除暂停时生效）");
         }
-        RCLCPP_INFO(this->get_logger(), "所有轴接收到手动模式启动命令");
+        else
+        {
+            // 手动模式
+            for (auto &axis : servo_axes_)
+            {
+                axis->start_manual_mode();
+            }
+            RCLCPP_INFO(this->get_logger(), "所有轴接收到手动模式启动命令");
+        }
     }
     else if (command == CMD_START_AUTO)
     {
-        // 自动模式
-        for (auto &axis : servo_axes_)
+        if (g_paused.load())
         {
-            axis->start_auto_mode();
+            g_pending_mode.store(2, std::memory_order_relaxed);
+            RCLCPP_INFO(this->get_logger(), "暂停中，已预选自动模式（解除暂停时生效）");
         }
-        RCLCPP_INFO(this->get_logger(), "所有轴接收到自动模式启动命令");
+        else
+        {
+            // 自动模式
+            for (auto &axis : servo_axes_)
+            {
+                axis->start_auto_mode();
+            }
+            RCLCPP_INFO(this->get_logger(), "所有轴接收到自动模式启动命令");
+        }
     }
     else if (command == CMD_STOP)
     {
@@ -566,6 +694,8 @@ void EthercatNode::handle_control_command(const std::string &command)
         {
             axis->stop();
         }
+        // 防御性清理：停机后若再进暂停/恢复，不该沿用旧预选
+        g_pending_mode.store(0, std::memory_order_relaxed);
         RCLCPP_INFO(this->get_logger(), "所有轴接收到停止命令");
         // 清除所有系统故障和告警
         if (fault_manager_)
@@ -576,25 +706,28 @@ void EthercatNode::handle_control_command(const std::string &command)
     }
     else if (command == CMD_CLEAR_FAULT)
     {
-        // 清除故障
+        // 清除故障（清故障是"故障后恢复"的必经步骤，此处清预选 = 等效"故障即清"）
         for (auto &axis : servo_axes_)
         {
             axis->clear_fault();
         }
+        g_pending_mode.store(0, std::memory_order_relaxed);
         RCLCPP_INFO(this->get_logger(), "所有轴接收到清除故障命令");
     }
     else if (command == CMD_RESET)
     {
-        // 重置
+        // 重置（重新来过，清预选）
         for (auto &axis : servo_axes_)
         {
             axis->reset_axis();
         }
+        g_pending_mode.store(0, std::memory_order_relaxed);
         RCLCPP_INFO(this->get_logger(), "所有轴接收到重置命令");
     }
     else if (command == "clear_all_faults")
     {
-        // 清除所有系统故障和告警
+        // 清除所有系统故障和告警（Python 通道走这条，同样清预选）
+        g_pending_mode.store(0, std::memory_order_relaxed);
         if (fault_manager_)
         {
             fault_manager_->clear_all_faults();
@@ -720,20 +853,42 @@ bool EthercatNode::parse_displacement_command(const std::string &command,
     return true;
 }
 
+// 使用轴配置的默认自动速度（auto_speed_）
 void EthercatNode::handle_axis_command(size_t axis_index, double newTargetPosition)
 {
     if (axis_index < servo_axes_.size())
     {
+        // 明确表态：本次使用默认 auto_speed_，清除上一次可能残留的百分比速度
+        servo_axes_[axis_index]->clear_move_speed();
         servo_axes_[axis_index]->set_target_displacement(newTargetPosition);
         servo_axes_[axis_index]->set_displacement_updated(true);
 
         RCLCPP_DEBUG(this->get_logger(), "轴[%zu] 位移指令: %.4fmm",
                      axis_index, newTargetPosition);
-        // // 详细状态检查
-        // RCLCPP_INFO(this->get_logger(), "运行状态=%s, 当前状态=%d",
-        //         axis->is_running() ? "是" : "否",
-        //         static_cast<int>(axis->get_current_state()));
     }
+}
+
+// 使用本次指定的移动速度（由 /xxx_command_pct 的百分比折算而来）
+void EthercatNode::handle_axis_command(size_t axis_index, double newTargetPosition, double speed)
+{
+    if (axis_index >= servo_axes_.size())
+    {
+        return;
+    }
+
+    auto &axis = servo_axes_[axis_index];
+    // 必须先设速度、再下发目标：否则实时线程可能"新目标配旧速度"跑一段
+    // set_move_speed 内部已校验 0 < speed <= max_jog_speed_ 且每周期步长 >= 1
+    if (!axis->set_move_speed(speed))
+    {
+        print_warning("轴 " + axis->get_name() + " 速度不可实现，指令被拒绝");
+        return;   // 拒绝，且不下发目标
+    }
+    axis->set_target_displacement(newTargetPosition);
+    axis->set_displacement_updated(true);
+
+    RCLCPP_DEBUG(this->get_logger(), "轴[%zu] 位移指令: %.4fmm, 速度 %.3f",
+                 axis_index, newTargetPosition, speed);
 }
 
 // ========== 角度控制功能 ==========
@@ -796,10 +951,250 @@ void EthercatNode::handle_angle_command(const std_msgs::msg::String::SharedPtr m
             continue;
         }
 
+        // 角度软限位检查与钳制（仅已启用限位的轴生效）
+        double clamped_deg = servo_axes_[axis_index]->clamp_angle(angle_deg);
+        if (clamped_deg != angle_deg && servo_axes_[axis_index]->has_angle_limits()) {
+            RCLCPP_WARN(this->get_logger(),
+                "轴 %s 角度指令 %.2f° 超出软限位 [%.1f°, %.1f°]，已钳制为 %.2f°",
+                axis_name.c_str(), angle_deg,
+                servo_axes_[axis_index]->get_min_angle(),
+                servo_axes_[axis_index]->get_max_angle(),
+                clamped_deg);
+        }
         // 发送角度指令（度），轴侧 angle_to_pulses 将度转换为脉冲
-        handle_axis_command(axis_index, angle_deg);
+        handle_axis_command(axis_index, clamped_deg);
         RCLCPP_INFO(this->get_logger(), "轴 %s 角度指令: %.4f rad (%.2f°)",
-                    axis_name.c_str(), angle_rad, angle_deg);
+                    axis_name.c_str(), angle_rad, clamped_deg);
+    }
+}
+
+// ========== 速度百分比指令（_pct 话题）==========
+// 通用解析："轴名:值" 或 "轴名:值:整数百分比"，多轴用 ';' 分隔
+// 与 parse_displacement_command 的关键区别：这里自行按 ':' 切分并严格校验，
+// 绝不把整段交给 std::stod —— 否则 "100.0:70" 会被静默解析成 100.0，百分比被无声吞掉
+bool EthercatNode::parse_command_ex(const std::string &command,
+                                    std::vector<AxisCmdEx> &axis_commands,
+                                    bool need_percent)
+{
+    axis_commands.clear();
+
+    std::vector<std::string> parts;
+    size_t start = 0;
+    size_t end = command.find(';');
+    while (end != std::string::npos)
+    {
+        parts.push_back(command.substr(start, end - start));
+        start = end + 1;
+        end = command.find(';', start);
+    }
+    parts.push_back(command.substr(start));
+
+    for (const auto &part : parts)
+    {
+        // 按 ':' 切分（轴名不含冒号）
+        std::vector<std::string> tokens;
+        size_t t_start = 0;
+        size_t t_end = part.find(':');
+        while (t_end != std::string::npos)
+        {
+            tokens.push_back(part.substr(t_start, t_end - t_start));
+            t_start = t_end + 1;
+            t_end = part.find(':', t_start);
+        }
+        tokens.push_back(part.substr(t_start));
+
+        // 去除空格
+        for (auto &t : tokens)
+        {
+            t.erase(0, t.find_first_not_of(" \t"));
+            if (!t.empty())
+            {
+                t.erase(t.find_last_not_of(" \t") + 1);
+            }
+        }
+
+        const size_t expect_tokens = need_percent ? 3u : 2u;
+        if (tokens.size() != expect_tokens)
+        {
+            print_error("指令段格式错误（应为 轴名:值" +
+                        std::string(need_percent ? ":百分比" : "") + "）: " + part);
+            return false;
+        }
+        if (tokens[0].empty() || tokens[1].empty())
+        {
+            print_error("轴名或值为空: " + part);
+            return false;
+        }
+
+        double value = 0.0;
+        try
+        {
+            size_t pos = 0;
+            value = std::stod(tokens[1], &pos);
+            if (pos != tokens[1].size())   // 拒绝 "100abc" 这类残留
+            {
+                print_error("目标值格式非法: " + tokens[1]);
+                return false;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            print_error("数值转换失败: " + tokens[1] + ", 错误: " + e.what());
+            return false;
+        }
+
+        int32_t percent = 0;
+        if (need_percent)
+        {
+            if (tokens[2].empty())
+            {
+                print_error("百分比为空: " + part);
+                return false;
+            }
+            try
+            {
+                size_t pos = 0;
+                percent = std::stoi(tokens[2], &pos);
+                // 强制整数：拒绝 "70.0" / "70abc" 等写法
+                if (pos != tokens[2].size())
+                {
+                    print_error("百分比必须为纯整数（如 70）: " + tokens[2]);
+                    return false;
+                }
+            }
+            catch (const std::exception &e)
+            {
+                print_error("百分比转换失败: " + tokens[2] + ", 错误: " + e.what());
+                return false;
+            }
+            if (percent < 5 || percent > 100)
+            {
+                print_error("百分比超出范围 [5, 100]: " + tokens[2]);
+                return false;
+            }
+        }
+
+        axis_commands.push_back({tokens[0], value, percent});
+    }
+
+    return true;
+}
+
+// 位移轴速度百分比指令：/displacement_command_pct  "axis4:100.0:70"
+void EthercatNode::handle_displacement_pct_command(const std_msgs::msg::String::SharedPtr msg)
+{
+    if (servo_axes_.empty())
+    {
+        RCLCPP_DEBUG(this->get_logger(), "等待伺服轴初始化...");
+        return;
+    }
+
+    std::string command = msg->data;
+    RCLCPP_INFO(this->get_logger(), "收到位移百分比指令: %s", command.c_str());
+
+    std::vector<AxisCmdEx> axis_commands;
+    if (!parse_command_ex(command, axis_commands, true))
+    {
+        print_error("位移百分比指令解析失败: " + command);
+        return;
+    }
+
+    for (const auto &cmd : axis_commands)
+    {
+        bool axis_found = false;
+        for (size_t i = 0; i < servo_axes_.size(); ++i)
+        {
+            if (servo_axes_[i]->get_name() != cmd.name)
+            {
+                continue;
+            }
+            axis_found = true;
+            if (!servo_axes_[i]->is_running())
+            {
+                RCLCPP_WARN(this->get_logger(),
+                    "轴 %s 当前不在手动/自动模式，忽略指令", cmd.name.c_str());
+                break;
+            }
+            // 目标速度 = 百分比 × 该轴最大速度(max_jog_speed_)
+            const double speed = cmd.percent / 100.0 * servo_axes_[i]->get_max_jog_speed();
+            handle_axis_command(i, cmd.value, speed);
+            RCLCPP_INFO(this->get_logger(),
+                "轴 %s 位移指令: %.3f mm, %d%% -> %.3f mm/s",
+                cmd.name.c_str(), cmd.value, cmd.percent, speed);
+            break;
+        }
+        if (!axis_found)
+        {
+            print_error("未找到轴: " + cmd.name);
+        }
+    }
+}
+
+// 角度轴速度百分比指令：/angle_command_pct  "axis6:1.5708:70"
+void EthercatNode::handle_angle_pct_command(const std_msgs::msg::String::SharedPtr msg)
+{
+    if (servo_axes_.empty())
+    {
+        RCLCPP_DEBUG(this->get_logger(), "等待伺服轴初始化...");
+        return;
+    }
+
+    std::string command = msg->data;
+    RCLCPP_INFO(this->get_logger(), "收到角度百分比指令: %s", command.c_str());
+
+    std::vector<AxisCmdEx> axis_commands;
+    if (!parse_command_ex(command, axis_commands, true))
+    {
+        print_error("角度百分比指令解析失败: " + command);
+        return;
+    }
+
+    for (const auto &cmd : axis_commands)
+    {
+        // 上层发送 rad，C++ 内部 angle_to_pulses 使用度
+        const double angle_deg = cmd.value * 180.0 / M_PI;
+
+        size_t axis_index = 0;
+        bool found = false;
+        for (size_t i = 0; i < servo_axes_.size(); i++)
+        {
+            if (servo_axes_[i]->get_name() == cmd.name)
+            {
+                axis_index = i;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            print_error("未找到轴: " + cmd.name);
+            continue;
+        }
+        if (!servo_axes_[axis_index]->is_running())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "轴 %s 当前不在手动/自动模式，忽略指令", cmd.name.c_str());
+            continue;
+        }
+
+        // 角度软限位检查与钳制（仅已启用限位的轴生效；只影响目标，不影响速度）
+        const double clamped_deg = servo_axes_[axis_index]->clamp_angle(angle_deg);
+        if (clamped_deg != angle_deg && servo_axes_[axis_index]->has_angle_limits())
+        {
+            RCLCPP_WARN(this->get_logger(),
+                "轴 %s 角度指令 %.2f° 超出软限位 [%.1f°, %.1f°]，已钳制为 %.2f°",
+                cmd.name.c_str(), angle_deg,
+                servo_axes_[axis_index]->get_min_angle(),
+                servo_axes_[axis_index]->get_max_angle(),
+                clamped_deg);
+        }
+
+        // 目标速度 = 百分比 × 该轴最大速度(max_jog_speed_)，角度轴单位 °/s
+        const double speed = cmd.percent / 100.0 * servo_axes_[axis_index]->get_max_jog_speed();
+        handle_axis_command(axis_index, clamped_deg, speed);
+        RCLCPP_INFO(this->get_logger(),
+            "轴 %s 角度指令: %.4f rad (%.2f°), %d%% -> %.3f °/s",
+            cmd.name.c_str(), cmd.value, clamped_deg, cmd.percent, speed);
     }
 }
 
@@ -816,6 +1211,15 @@ void EthercatNode::handle_jog_command(const std_msgs::msg::String::SharedPtr msg
 {
     std::string command = msg->data;
     RCLCPP_INFO(this->get_logger(), "收到点动命令: %s", command.c_str());
+
+    // 暂停中（g_paused）直接忽略点动指令。
+    // /jog_command 没有模式检查，而 READY 下点动标志只置不清（会残留到解除暂停后执行），
+    // 这里做闸门，配合 main 在翻转暂停时清标志，彻底消除"恢复瞬间突然动一下"。
+    if (g_paused.load())
+    {
+        RCLCPP_INFO(this->get_logger(), "暂停中，忽略点动命令: %s", command.c_str());
+        return;
+    }
     
     // 解析格式："axis1_1:forward" 或 "axis1_1:reverse" 或 "axis1_1:stop"
     size_t colon_pos = command.find(':');
@@ -859,6 +1263,21 @@ void EthercatNode::handle_jog_command(const std_msgs::msg::String::SharedPtr msg
 
 // ========== IO模块相关函数 ==========
 
+// IO 初始化失败的统一出口（fail fast）
+void EthercatNode::fail_fast_io(const std::string &reason)
+{
+    const std::string msg = "IO 初始化失败，系统退出: " + reason;
+    print_error(msg);
+    RCLCPP_FATAL(this->get_logger(), "%s", msg.c_str());
+
+    io_running_.store(false);
+    g_should_exit.store(true);
+    node_shutting_down_.store(true);
+    if (rclcpp::ok()) {
+        rclcpp::shutdown();
+    }
+}
+
 void EthercatNode::start_io_monitoring()
 {
     if (io_running_.load())
@@ -868,10 +1287,14 @@ void EthercatNode::start_io_monitoring()
     }
 
     // 从YAML加载IO配置
+    // 路径由 io_config_path 参数给出；契约 C1~C4 任一被违反 → 拒绝启动（fail fast）
     std::string io_config_path = this->get_parameter("io_config_path").as_string();
     if (!load_io_config(io_config_path)) {
-        print_error("加载IO配置失败，使用默认配置");
+        fail_fast_io("IO 配置不合法（详见上方 [IO] 报错）");
+        return;
     }
+    RCLCPP_INFO(this->get_logger(), "IO 配置已加载: %s (DI %d 点 / DO %d 点)",
+                io_config_path.c_str(), g_di_count, g_do_count);
 
     // 初始化Modbus接口
     {
@@ -887,24 +1310,22 @@ void EthercatNode::start_io_monitoring()
                                                   do_ip, g_modbus_port, g_modbus_slave_id);
         }
         if (modbus_result != 0) {
-            print_error("Modbus初始化失败");
+            fail_fast_io("Modbus 初始化失败（设备不可达/端口错误，详见上方连接错误）");
             return;
         }
     }
 
     io_running_.store(true);
 
-    // 创建IO监控线程
-    if (pthread_create(&io_thread_, nullptr, io_monitor_thread, this) != 0)
-    {
-        print_error("创建IO监控线程失败");
-        io_running_.store(false);
-        cleanup_modbus_interface();
-        return;
+    // 方案A：不再创建IO监控线程
+    // DI读取与信号处理统一由main.cpp主循环执行（约100ms周期）
+    if (!is_di_module_enabled()) {
+        print_warning("DI模块已禁用");
     }
-
-    pthread_setname_np(io_thread_, "io-monitor");
-    RCLCPP_INFO(this->get_logger(), "IO监控线程启动成功");
+    if (!is_do_module_enabled()) {
+        print_warning("DO模块已禁用");
+    }
+    RCLCPP_INFO(this->get_logger(), "IO接口初始化完成（主线程轮询模式）");
 }
 
 void EthercatNode::stop_io_monitoring()
@@ -916,38 +1337,38 @@ void EthercatNode::stop_io_monitoring()
 
     io_running_.store(false);
 
-    if (io_thread_)
-    {
-        pthread_join(io_thread_, nullptr);
-        io_thread_ = 0;
-    }
-
+    // 方案A：无IO监控线程需要等待，仅清理Modbus连接（完全关闭时调用）
     cleanup_modbus_interface();
     pthread_mutex_destroy(&io_mutex_);
-    RCLCPP_INFO(this->get_logger(), "IO监控线程已停止");
+    RCLCPP_INFO(this->get_logger(), "IO接口已停止并清理Modbus连接");
 }
 
 void EthercatNode::handle_io_signals(DI_Interface di)
 {
-    // 发布IO状态到Python节点
-    // publish_py_io_status(di);
-
     monitor_di_changes(di);
     pthread_mutex_lock(&io_mutex_);
     current_di_status_ = di;
     pthread_mutex_unlock(&io_mutex_);
 
     // 此处仅检测按钮状态并设置全局标志，不直接控制DO
-    // AL states 0x08 (SAFE-OP) 且全部进入自动模式 - 通知灯光控制器熄灭复位灯，切换为绿灯闪烁
-    if (master_state.al_states == 0x08 && are_all_axes_in_auto_mode())
-    {
-        notify_system_ready();
-        // RCLCPP_INFO(this->get_logger(), "AL states=0x08 且全部轴进入自动模式，系统就绪");
-    }
+    // 注：系统就绪灯语（黄闪 → 绿闪 → 绿常亮）的判定已统一收敛到 main.cpp 主循环，
+    //     判定源为“实时 al_states==0x08 + 全部轴 is_ready()”；此处不再重复判定，
+    //     避免全局 master_state（1Hz 刷新、暂停释放主站后仍残留 0x08）造成二次误触发。
 
     // 新增：IO控制模式切换（仅在宏开关启用时生效）
+    // 注意：手自动按钮是"可选角色"（di_roles.manual_auto_button）：
+    //       老机型在 io_config.yaml 配置了该角色 → 按 DI 电平（高=自动/低=手动）；
+    //       圣白机型点表没有该按钮 → 角色未配置 → 按 di_module.default_operation_mode
+    //       （auto|manual，缺省 manual）决定，从而支持"无按钮机型上电进自动"。
 #if CONTROL_SOURCE_IO
-    bool current_manual_auto_state = di.manual_auto_button; // 当前按钮状态（DI04）
+    // 手自动来源（唯一判定处）：
+    //   1) 配置了 di_roles.manual_auto_button → 以该 DI 电平为准（高=自动、低=手动，无极性反转）；
+    //   2) 该可选角色未配置（如圣白机型无手自动按钮）→ 退回 di_module.default_operation_mode
+    //      （auto|manual，缺省 manual）。
+    // 注：这里是独立口径，不要改用 is_ready() 等其它判定（灯语判定在 main.cpp 是另一套）。
+    const bool has_manual_auto_btn = (g_di_role_offset[DI_ROLE_MANUAL_AUTO_BUTTON] >= 0);
+    const bool current_manual_auto_state =
+        has_manual_auto_btn ? di.manual_auto_button : g_default_auto_mode;
 
     // 检查所有轴是否都处于READY状态
     bool all_axes_ready = true;
@@ -961,14 +1382,23 @@ void EthercatNode::handle_io_signals(DI_Interface di)
         }
     }
 
-    // 如果所有轴都处于READY状态，尝试模式切换
-    if (all_axes_ready)
+    // 暂停中（g_paused）不自动进模式：
+    //   暂停时轴已被 stop() 带回 READY，若仍按"全轴 READY"进模式，暂停会被立刻解除，
+    //   "再按一次暂停才恢复"就无从触发。
+    //   同时把边沿记忆压成 false —— 解除暂停后即使 main 那次进模式命令失败，仍能重新进模式。
+    if (g_paused.load())
+    {
+        last_all_axes_ready_ = false;
+    }
+    // 所有轴都处于READY状态时，尝试模式切换
+    else if (all_axes_ready)
     {
         // 仅在状态变化时打印日志（边沿检测）
         if (!last_all_axes_ready_ || last_manual_auto_state_ != current_manual_auto_state)
         {
-            RCLCPP_INFO(this->get_logger(), "所有轴已就绪，准备模式切换。手自动按钮状态: %s",
-                        current_manual_auto_state ? "自动" : "手动");
+            RCLCPP_INFO(this->get_logger(), "所有轴已就绪，准备模式切换。手自动状态: %s (来源: %s)",
+                        current_manual_auto_state ? "自动" : "手动",
+                        has_manual_auto_btn ? "DI手自动按钮电平" : "配置默认模式");
 
             // 触发模式切换命令
             std::string command = current_manual_auto_state ? CMD_START_AUTO : CMD_START_MANUAL;
@@ -977,9 +1407,12 @@ void EthercatNode::handle_io_signals(DI_Interface di)
             RCLCPP_INFO(this->get_logger(), "已发送%s模式切换命令",
                         current_manual_auto_state ? "自动" : "手动");
         }
+        last_all_axes_ready_ = true;
     }
     else
     {
+        last_all_axes_ready_ = false;
+
         // 记录哪些轴未就绪（用于调试）
         static int log_counter = 0;
         if (log_counter++ % 500 == 0)
@@ -999,8 +1432,8 @@ void EthercatNode::handle_io_signals(DI_Interface di)
         }
     }
 
-    // 更新状态记忆（用于下次边沿检测）
-    last_all_axes_ready_ = all_axes_ready;
+    // 更新手自动记忆（用于下次边沿检测）
+    // 注：last_all_axes_ready_ 已在上方各分支内按"暂停抑制"后的语义更新，不能在这里无条件覆盖。
     last_manual_auto_state_ = current_manual_auto_state;
 #endif
     // 发布IO状态
@@ -1014,6 +1447,15 @@ void EthercatNode::publish_io_status()
         return;
     }
 
+    // 节流：/io_status固定约10Hz发布（与原IO线程100ms周期一致）。
+    // 主循环提速后若不限频，HMI的Qt事件队列会被刷爆导致界面"无响应"
+    static auto last_publish_time = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_publish_time < std::chrono::milliseconds(100)) {
+        return;
+    }
+    last_publish_time = now;
+
     auto msg = std_msgs::msg::String();
     std::stringstream ss;
 
@@ -1023,44 +1465,26 @@ void EthercatNode::publish_io_status()
     DI_Interface di = current_di_status_;
     DO_Interface do_status = get_current_do_state();
 
-    // 按照表格顺序发布DI状态 (0-15)
+    // 发布编号约定（契约 C5）：DI{n}/DO{n} 的 n = 设备位偏移（= 数组下标），
+    // 与 io_config.yaml 中 di_signals/do_signals 的书写顺序（按 address 升序）严格一致。
+    // HMI 与下游都按「第 n 个 token ↔ di_signals[n]」对位，因此这里直接用 raw[] 遍历，
+    // 不再手写字段指针数组（那样会把语义与位置重新绑死）。
     ss << "DI状态: ";
-    ss << "DI00:" << (di.start_button ? "1" : "0") << ",";           // M500 启动按钮
-    ss << "DI01:" << (di.reset_button ? "1" : "0") << ",";           // M501 复位按钮
-    ss << "DI02:" << (di.pause_button ? "1" : "0") << ",";           // M502 暂停按钮
-    ss << "DI03:" << (di.manual_auto_button ? "1" : "0") << ",";     // M503 手自动按钮
-    ss << "DI04:" << (di.emergency_stop ? "1" : "0") << ",";         // M504 急停按钮
-    ss << "DI05:" << (di.air_supply ? "1" : "0") << ",";             // M505 气源输入
-    ss << "DI06:" << (di.di_M506 ? "1" : "0") << ",";                // M506
-    ss << "DI07:" << (di.di_M507 ? "1" : "0") << ",";                // M507
-    ss << "DI08:" << (di.di_M508 ? "1" : "0") << ",";                // M508
-    ss << "DI09:" << (di.di_M509 ? "1" : "0") << ",";                // M509
-    ss << "DI10:" << (di.di_M510 ? "1" : "0") << ",";                // M510
-    ss << "DI11:" << (di.di_M511 ? "1" : "0") << ",";                // M511
-    ss << "DI12:" << (di.di_M512 ? "1" : "0") << ",";                // M512
-    ss << "DI13:" << (di.di_M513 ? "1" : "0") << ",";                // M513
-    ss << "DI14:" << (di.di_M514 ? "1" : "0") << ",";                // M514
-    ss << "DI15:" << (di.di_M515 ? "1" : "0");                       // M515
+    for (int i = 0; i < di.count; ++i) {
+        ss << "DI" << (i < 10 ? "0" : "") << i << ":" << (di.raw[i] ? "1" : "0");
+        if (i + 1 < di.count) {
+            ss << ",";
+        }
+    }
 
     ss << " | DO状态: ";
 
-    // 按照表格顺序发布DO状态 (0-15)
-    ss << "DO00:" << (do_status.start_button_light ? "1" : "0") << ",";   // M800 启动按钮灯
-    ss << "DO01:" << (do_status.reset_button_light ? "1" : "0") << ",";   // M801 复位按钮灯
-    ss << "DO02:" << (do_status.pause_button_light ? "1" : "0") << ",";   // M802 暂停按钮灯
-    ss << "DO03:" << (do_status.buzzer ? "1" : "0") << ",";               // M803 蜂鸣器
-    ss << "DO04:" << (do_status.red_light ? "1" : "0") << ",";            // M804 三色红灯
-    ss << "DO05:" << (do_status.yellow_light ? "1" : "0") << ",";         // M805 三色黄灯
-    ss << "DO06:" << (do_status.green_light ? "1" : "0") << ",";          // M806 三色绿灯
-    ss << "DO07:" << (do_status.do_M807 ? "1" : "0") << ",";              // M807
-    ss << "DO08:" << (do_status.do_M808 ? "1" : "0") << ",";              // M808
-    ss << "DO09:" << (do_status.do_M809 ? "1" : "0") << ",";              // M809
-    ss << "DO10:" << (do_status.do_M810 ? "1" : "0") << ",";              // M810
-    ss << "DO11:" << (do_status.do_M811 ? "1" : "0") << ",";              // M811
-    ss << "DO12:" << (do_status.do_M812 ? "1" : "0") << ",";              // M812
-    ss << "DO13:" << (do_status.do_M813 ? "1" : "0") << ",";              // M813
-    ss << "DO14:" << (do_status.do_M814 ? "1" : "0") << ",";              // M814
-    ss << "DO15:" << (do_status.do_M815 ? "1" : "0");                     // M815
+    for (int i = 0; i < do_status.count; ++i) {
+        ss << "DO" << (i < 10 ? "0" : "") << i << ":" << (do_status.raw[i] ? "1" : "0");
+        if (i + 1 < do_status.count) {
+            ss << ",";
+        }
+    }
 
     pthread_mutex_unlock(&io_mutex_);
 
@@ -1068,79 +1492,42 @@ void EthercatNode::publish_io_status()
     io_status_pub_->publish(msg);
 }
 
-// IO监控线程函数
-void *io_monitor_thread(void *arg)
-{
-    EthercatNode *node = static_cast<EthercatNode *>(arg);
-    time_t last_display = time(NULL);
-    RCLCPP_INFO(node->get_logger(), "IO监控线程开始运行");
-
-    // DI/DO 模块禁用警告（运行时检查）
-    if (!is_di_module_enabled()) {
-        static bool di_disabled_warned = false;
-        if (!di_disabled_warned) {
-            node->print_warning("DI模块已禁用");
-            di_disabled_warned = true;
-        }
-    }
-
-    if (!is_do_module_enabled()) {
-        static bool do_disabled_warned = false;
-        if (!do_disabled_warned) {
-            node->print_warning("DO模块已禁用");
-            do_disabled_warned = true;
-        }
-    }
-
-    while (node->is_io_running() && !g_should_exit.load())
-    {
-        // 读取DI信号（如果启用）
-        DI_Interface di;
-        di = read_all_di_signals();
-
-        // 获取当前DO状态
-        // DO_Interface do_control = get_current_do_state();
-
-        // 处理IO信号
-        node->handle_io_signals(di);
-
-        usleep(100000); // 100ms刷新周期
-    }
-
-    RCLCPP_INFO(node->get_logger(), "IO监控线程退出");
-    return nullptr;
-}
+// 方案A：IO监控线程已移除
+// 原线程逻辑（读DI -> handle_io_signals，100ms周期）已合并到main.cpp主循环，
+// 由主线程统一执行，消除主线程与IO线程对灯光状态的并发访问。
 
 void EthercatNode::monitor_di_changes(const DI_Interface &current_di)
 {
     static DI_Interface previous_di = {0};
+    static bool first = true;
 
-    // 检查每个DI信号的变化
-    std::vector<std::pair<std::string, bool>> changes;
-
-    if (current_di.di_M511 != previous_di.di_M511)
+    // 只监控角色表里的语义位，与具体点位顺序解耦；
+    // 想排查某个通用点位（如气压），请直接看 /io_status 或按位偏移自查，不要再往这里加硬编码。
+    if (first)
     {
-        changes.push_back({"DI11", current_di.di_M511});
-    }
-    if (current_di.di_M512 != previous_di.di_M512)
-    {
-        changes.push_back({"DI12", current_di.di_M512});
-    }
-    if (current_di.di_M513 != previous_di.di_M513)
-    {
-        changes.push_back({"DI13", current_di.di_M513});
-    }
-    if (current_di.di_M514 != previous_di.di_M514)
-    {
-        changes.push_back({"DI14", current_di.di_M514});
+        first = false;
+        RCLCPP_INFO(this->get_logger(),
+                    "[DI] 初始状态: 急停(正常)=%d 启动=%d 复位=%d 暂停=%d",
+                    current_di.emergency_stop ? 1 : 0,
+                    current_di.start_button ? 1 : 0,
+                    current_di.reset_button ? 1 : 0,
+                    current_di.pause_button ? 1 : 0);
     }
 
-    // 打印变化
-    for (const auto &change : changes)
+    const struct { const char *label; bool cur; bool prev; } watch[] = {
+        {"急停(正常)", current_di.emergency_stop, previous_di.emergency_stop},
+        {"启动",       current_di.start_button,   previous_di.start_button},
+        {"复位",       current_di.reset_button,   previous_di.reset_button},
+        {"暂停",       current_di.pause_button,   previous_di.pause_button},
+    };
+
+    for (const auto &w : watch)
     {
-        RCLCPP_INFO(this->get_logger(), "%s 状态变化: %s",
-                    change.first.c_str(),
-                    change.second ? "HIGH" : "LOW");
+        if (w.cur != w.prev)
+        {
+            RCLCPP_INFO(this->get_logger(), "[DI] %s 状态变化: %s",
+                        w.label, w.cur ? "HIGH" : "LOW");
+        }
     }
 
     // 更新前一次状态
@@ -1168,10 +1555,12 @@ void EthercatNode::handle_do_control(const std_msgs::msg::String::SharedPtr msg)
     // 执行DO控制
     int do_address = std::stoi(do_cmd.do_address);
 
-    // 禁止通过外部命令修改按钮灯状态（前3个DO），由handle_io_signals独占控制
-    if (do_address >= g_do_base_address && do_address <= g_do_base_address + 2)
+    // 禁止通过外部命令修改"受保护"的 DO：
+    // 缺省 = 三个按钮灯角色对应的位（由灯光控制器独占），可用 safety.protected_do 覆盖
+    const int do_off = do_address - g_do_base_address;
+    if (do_off >= 0 && do_off < IO_MAX_SIGNALS && g_do_protected[do_off])
     {
-        RCLCPP_WARN(this->get_logger(), "拒绝外部修改按钮灯DO%d，按钮灯由IO模块独占控制", do_address);
+        RCLCPP_WARN(this->get_logger(), "拒绝外部修改受保护的DO%d（由灯光控制器独占控制）", do_address);
         return;
     }
 
@@ -1193,16 +1582,47 @@ void EthercatNode::handle_do_control(const std_msgs::msg::String::SharedPtr msg)
 }
 
 // 虚拟IO指令处理
+// 方案一：统一事件入口——虚拟按钮只设置虚拟按键电平，
+// 由主循环与实体DI合并后统一走update_button_lights状态机，
+// 灯效与系统动作与实体按钮完全一致（急停为点击切换锁存，再按一次解除）
 void EthercatNode::handle_virtual_io(const std_msgs::msg::String::SharedPtr msg) {
     std::string command = msg->data;
 
-    if (command == "virtual_start") {
-        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟启动");
-        g_start_button_pressed.store(true);
+    if (command == "virtual_start_down") {
+        set_virtual_button(VBTN_START, true);
+        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟启动 按下");
+    }
+    else if (command == "virtual_start_up") {
+        set_virtual_button(VBTN_START, false);
+    }
+    else if (command == "virtual_reset_down") {
+        set_virtual_button(VBTN_RESET, true);
+        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟复位 按下（按住3秒确认）");
+    }
+    else if (command == "virtual_reset_up") {
+        set_virtual_button(VBTN_RESET, false);
+    }
+    else if (command == "virtual_pause_down") {
+        set_virtual_button(VBTN_PAUSE, true);
+        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟暂停 按下");
+    }
+    else if (command == "virtual_pause_up") {
+        set_virtual_button(VBTN_PAUSE, false);
     }
     else if (command == "virtual_estop") {
-        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟急停");
-        g_full_shutdown_requested.store(true);
+        // 硬件急停未复位时忽略虚拟急停切换：
+        //   此时系统已在安全停机态，软件锁存没有额外收益，反而会制造
+        //   "硬件复位后必须到 HMI 点一次解除" 的隐性依赖，并让界面与实际相反
+        //   （HMI 会因 |ESTOP 显示"点击解除"，点了却无效——这是刻意为之，避免误显示为已解除）。
+        if (g_hw_estop_active.load()) {
+            RCLCPP_WARN(this->get_logger(),
+                        "[VirtualIO] 硬件急停未复位，忽略虚拟急停切换");
+            return;
+        }
+        // 点击切换锁存：再按一次解除
+        toggle_virtual_estop();
+        RCLCPP_INFO(this->get_logger(), "[VirtualIO] 虚拟急停 %s",
+                    is_virtual_estop_active() ? "激活（再按一次解除）" : "解除");
     }
     else {
         RCLCPP_WARN(this->get_logger(), "[VirtualIO] 未知命令: %s", command.c_str());

@@ -3,3 +3,9 @@ install/
 log/
 ethercat_controller/src/test.txt
 .codebuddy/
+*.pyc
+__pycache__/
+.vscode/
+.idea/
+.DS_Store
+*~

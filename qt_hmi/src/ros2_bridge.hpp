@@ -23,7 +23,7 @@ struct IoSignalInfo {
 };
 
 /// ROS2 通信桥接类 — 同时继承 QObject 和 rclcpp::Node
-/// 提供5个发布器，通过 Qt 信号通知 UI
+/// 提供 8 个发布器（含速度百分比指令），通过 Qt 信号通知 UI
 /// 轴配置从 axes_config.yaml 动态加载
 /// IO 配置从 io_config.yaml 动态加载
 class Ros2Bridge : public QObject, public rclcpp::Node
@@ -44,11 +44,32 @@ public:
     const std::string &getCalcMode(int idx) const { return axis_calc_modes_[idx]; }
     /// 根据 ROS2 轴名查找索引, 未找到返回 -1
     int getAxisIndex(const std::string &name) const;
+    /// 第 idx 个轴当前的回原标记 (来自 YAML operation_mode, 写入后同步更新)
+    bool getAxisHomingValue(int idx) const { return axis_homing_values_[idx]; }
+    /// 第 idx 个轴是否列入回原白名单 (按 brand 判断, 供 UI 能力提示)
+    bool isAxisHomingCapable(int idx) const { return axis_homing_capable_[idx]; }
+    /// axes_config.yaml 的完整路径 (构造时记录)
+    const std::string &getAxesConfigPath() const { return axes_config_path_; }
+
+    // ————— 回原配置写入 (方案C: 直接改 axes_config.yaml) —————
+    /// 将指定轴的回原标记写回 axes_config.yaml
+    /// - 行级文本编辑, 保留原有注释与缩进
+    /// - 写入前备份 .bak; 首次写入额外生成 .factory 出厂快照
+    /// - 写入后自校验, 失败则不落盘
+    /// @param homing_flags 轴名 -> 是否需要回原; 未包含的轴保持文件原值
+    /// @return 是否写入成功
+    bool saveAxesHomingConfig(const std::map<std::string, bool> &homing_flags);
+
+    /// 用 .factory 出厂快照覆盖 axes_config.yaml, 并重新加载
+    bool restoreAxesHomingFactory();
+
+    /// 重新从 axes_config.yaml 加载轴配置 (供 UI 刷新回原标记)
+    bool reloadAxesConfig();
 
     // ————— IO 配置访问接口 (从 io_config.yaml 动态加载) —————
-    /// 获取DI输入信号列表 (M500~M515)
+    /// 获取DI输入信号列表 (M500~M547)
     const std::vector<IoSignalInfo> &getDiSignals() const { return di_signals_; }
-    /// 获取DO输出信号列表 (M800~M815)
+    /// 获取DO输出信号列表 (M800~M847)
     const std::vector<IoSignalInfo> &getDoSignals() const { return do_signals_; }
 
 public slots:
@@ -58,10 +79,14 @@ public slots:
     void publishJogCommand(const std::string &axis, const std::string &direction);
     void publishJogStop(const std::string &axis);
     void publishJogStopAll();
-    // — 位移命令 —
+    // — 位移命令（使用 YAML auto_speed 默认速度）—
     void publishDisplacement(const std::string &axis, double position_mm);
-    // — 角度命令 —
+    // — 角度命令（使用 YAML auto_speed 默认速度）—
     void publishAngle(const std::string &axis, double angle_deg);
+    // — 位移命令（带速度百分比，percent 取值 5~100 的整数）—
+    void publishDisplacementPct(const std::string &axis, double position_mm, int percent);
+    // — 角度命令（带速度百分比，percent 取值 5~100 的整数）—
+    void publishAnglePct(const std::string &axis, double angle_deg, int percent);
     // — IO 控制 —
     void publishIoControl(const std::string &address, int value);
     // — 虚拟IO —
@@ -81,13 +106,16 @@ signals:
                             const std::vector<double> &positions);
 
 private:
-    // 5 个发布器
+    // 8 个发布器
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr control_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr jog_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr displacement_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr angle_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr io_control_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr virtual_io_pub_;
+    // 速度百分比指令（走 /displacement_command_pct、/angle_command_pct）
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr displacement_pct_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr angle_pct_pub_;
 
     // 订阅器
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr system_status_sub_;
@@ -103,6 +131,9 @@ private:
     std::vector<std::string> axis_names_;          // ROS2通信名 (如 "axis1")
     std::vector<std::string> axis_display_names_;  // 界面显示名 (如 "X轴平移台")
     std::vector<std::string> axis_calc_modes_;     // 计算模式 ("DISPLACEMENT"/"ANGLE")
+    std::vector<bool>        axis_homing_values_;  // 当前 YAML 中的回原标记（初始值）
+    std::vector<bool>        axis_homing_capable_; // 是否列入回原白名单（按 brand）
+    std::string              axes_config_path_;    // axes_config.yaml 完整路径
 
     // ————— IO 配置 (从 io_config.yaml 动态加载) —————
     std::vector<IoSignalInfo> di_signals_;   // DI 输入信号列表

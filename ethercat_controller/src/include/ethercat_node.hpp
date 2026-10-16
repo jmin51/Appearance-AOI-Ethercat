@@ -32,6 +32,14 @@
 #define CMD_CLEAR_FAULT "clear_fault"
 #define CMD_RESET "reset"
 
+// 扩展指令：轴名:目标值[:百分比]
+// percent 仅在 need_percent=true 时有效，取值 5~100（纯整数，如 70）
+struct AxisCmdEx {
+    std::string name;     // 轴名（与 axes_config.yaml 的 name 一致）
+    double      value;    // 目标值（位移轴: mm；角度轴: rad）
+    int32_t     percent;  // 速度百分比（相对该轴 max_jog_speed_）
+};
+
 class EthercatNode : public rclcpp::Node
 {
 public:
@@ -58,6 +66,9 @@ public:
     // IO模块相关
     void start_io_monitoring();
     void stop_io_monitoring();
+    // IO 初始化失败的统一出口：配置非法或设备连不上 → 打印 → 置退出标志 → 关闭 ROS
+    // （属部署错误，必须 fail fast，避免"IO 全是假数据"导致系统假死且难定位）
+    void fail_fast_io(const std::string &reason);
     void handle_io_signals(DI_Interface di);
     bool is_io_running() const { return io_running_.load(); }
 
@@ -74,13 +85,19 @@ private:
     bool parse_displacement_command(const std::string &command,
                                     std::vector<std::pair<std::string, double>> &axis_commands);
 
-    void handle_axis_command(size_t axis_index, double newTargetPosition);
+    // 通用解析："轴名:值"（need_percent=false）或 "轴名:值:整数百分比"（true）
+    // 百分比必须为纯整数且 5<=pct<=100；返回 false 表示整条命令非法（整条拒绝）
+    bool parse_command_ex(const std::string &command,
+                          std::vector<AxisCmdEx> &axis_commands,
+                          bool need_percent);
+
+    void handle_axis_command(size_t axis_index, double newTargetPosition);              // 用默认 auto_speed
+    void handle_axis_command(size_t axis_index, double newTargetPosition, double speed); // 用本次指定速度
     double pulses_to_displacement(int32_t pulses, int32_t initial_pulses);
     void publish_io_status(); // 新增：发布IO状态
 
     // 添加与Python节点通信的方法
     void handle_py_control_command(const std_msgs::msg::String::SharedPtr msg);
-    // void publish_py_io_status(const DI_Interface &di);
 
     // 添加点动指令处理函数
     void handle_jog_command(const std_msgs::msg::String::SharedPtr msg);
@@ -97,15 +114,16 @@ private:
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr displacement_sub_; // 从Float64MultiArray改为String
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr control_command_sub_;
 
-    // 添加双轴位移订阅器
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr dual_displacement_sub_;
-     // 添加XYR三轴位移订阅器
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr XYR_displacement_sub_;
-
     // 添加角度控制订阅器 (rad)
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr angle_sub_;
     void handle_angle_command(const std_msgs::msg::String::SharedPtr msg);
     double rad_to_mm(double rad);  // 弧度转毫米
+
+    // 速度百分比指令订阅器（位移轴 / 角度轴各一，消息格式 "轴名:值:百分比"）
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr displacement_pct_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr angle_pct_sub_;
+    void handle_displacement_pct_command(const std_msgs::msg::String::SharedPtr msg);
+    void handle_angle_pct_command(const std_msgs::msg::String::SharedPtr msg);
 
     // 添加与Python节点通信的发布器和订阅器
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr py_io_status_pub_;
@@ -139,7 +157,6 @@ private:
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr fault_code_pub_;
 
     // IO模块相关
-    pthread_t io_thread_;
     std::atomic<bool> io_running_{false};
     DI_Interface current_di_status_;
     DO_Interface current_do_control_;
@@ -172,13 +189,14 @@ extern std::atomic<bool> g_should_exit;
 // 在全局变量定义区域添加
 extern std::atomic<bool> g_system_running;       // 系统运行状态
 extern std::atomic<bool> g_start_button_pressed; // 启动按钮状态
-extern std::atomic<bool> g_pause_button_pressed; // 暂停按钮状态
+extern std::atomic<bool> g_pause_toggle_requested; // 暂停按钮上升沿请求（物理+虚拟）
+extern std::atomic<bool> g_paused;                 // 暂停锁存（true=暂停中，轴驻留 READY）
+extern std::atomic<int>  g_pending_mode;           // 暂停期间话题预选的模式（0=无,1=手动,2=自动）
 extern std::atomic<bool> g_reset_button_pressed; // 新增：复位按钮状态
 
 // 全局函数声明
 void signal_handler(int signum);
 void safe_shutdown(bool is_pause);
 void *rt_task_wrapper(void *arg);
-void *io_monitor_thread(void *arg); // 新增IO监控线程
 
 #endif // ETHERCAT_NODE_HPP

@@ -40,4 +40,16 @@ extern std::atomic<bool> g_full_shutdown_requested;
 // 复位按钮3秒确认后：急停完成，待执行回原流程
 extern std::atomic<bool> g_reset_pending_after_estop;
 
+// 硬件（物理）急停电平：true = 急停按下（由主循环按 DI 极性归一化后写入）。
+// 与 g_virtual_estop_active（软件锁存、HMI 可解除）严格独立，二者互不写入：
+//   - 物理急停是电平型，松开即恢复；虚拟急停是锁存型，只能由 HMI toggle 解除。
+//   - 物理侧的任何动作都不影响软件锁存（否则会静默解除虚拟急停，属安全漏洞）。
+extern std::atomic<bool> g_hw_estop_active;
+
+// 按设计流程停机锁存（急停 / 复位回原 / 待启动触发）。
+// 用途：安全停机后轴状态会被冻结（实时线程已停、主站已释放），
+//       若继续按轴状态聚合上报，状态栏会残留 READY/AUTO，与实际"已停机"不符。
+//       publish_system_status() 据此把基态报告为 STOPPED。
+extern std::atomic<bool> g_system_halted;
+
 #endif

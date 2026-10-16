@@ -3,6 +3,7 @@
 #include <QGroupBox>
 #include <QLabel>
 #include <QMessageBox>
+#include <QVariant>
 #include <cmath>
 
 AxisPanel::AxisPanel(const std::string &axis_name,
@@ -35,6 +36,14 @@ AxisPanel::AxisPanel(const std::string &axis_name,
         step_spin_->setDecimals(1);
         step_layout->addWidget(step_spin_);
         layout->addLayout(step_layout);
+
+        // 速度百分比选择 ("默认" = 使用 YAML auto_speed；其余档走 *_pct 话题)
+        auto *speed_layout = new QHBoxLayout();
+        speed_layout->addWidget(new QLabel("速度(%):", this));
+        initSpeedCombo();
+        speed_layout->addWidget(speed_pct_combo_);
+        speed_layout->addStretch();
+        layout->addLayout(speed_layout);
 
         // 按钮网格 3×2
         auto *btn_grid = new QGridLayout();
@@ -71,6 +80,14 @@ AxisPanel::AxisPanel(const std::string &axis_name,
     } else {
         // 角度轴: 2 个按钮 (angle_input + disp_input)
         step_spin_ = nullptr;
+
+        // 速度百分比选择 ("默认" = 使用 YAML auto_speed；其余档走 *_pct 话题)
+        auto *speed_layout = new QHBoxLayout();
+        speed_layout->addWidget(new QLabel("速度(%):", this));
+        initSpeedCombo();
+        speed_layout->addWidget(speed_pct_combo_);
+        speed_layout->addStretch();
+        layout->addLayout(speed_layout);
 
         auto *btn_layout = new QHBoxLayout();
 
@@ -116,14 +133,14 @@ void AxisPanel::updateJointPosition(double value)
 void AxisPanel::onOrigin()
 {
     position_mm_ = 0.0;
-    bridge_->publishDisplacement(axis_name_, 0.0);
+    sendDisplacement(0.0);
     updatePositionDisplay(0.0);
 }
 
 void AxisPanel::onPreset()
 {
     position_mm_ = 10.0;
-    bridge_->publishDisplacement(axis_name_, 10.0);
+    sendDisplacement(10.0);
     updatePositionDisplay(10.0);
 }
 
@@ -131,7 +148,7 @@ void AxisPanel::onForwardStep()
 {
     double step = step_spin_->value();
     position_mm_ += step;
-    bridge_->publishDisplacement(axis_name_, position_mm_);
+    sendDisplacement(position_mm_);
     updatePositionDisplay(position_mm_);
 }
 
@@ -139,7 +156,7 @@ void AxisPanel::onReverseStep()
 {
     double step = step_spin_->value();
     position_mm_ -= step;
-    bridge_->publishDisplacement(axis_name_, position_mm_);
+    sendDisplacement(position_mm_);
     updatePositionDisplay(position_mm_);
 }
 
@@ -152,7 +169,7 @@ void AxisPanel::onDispInput()
         position_mm_, -10000.0, 10000.0, 3, &ok);
     if (ok) {
         position_mm_ = val;
-        bridge_->publishDisplacement(axis_name_, val);
+        sendDisplacement(val);
         updatePositionDisplay(val);
     }
 }
@@ -166,7 +183,7 @@ void AxisPanel::onAngleInput()
         position_deg_, -360.0, 360.0, 2, &ok);
     if (ok) {
         position_deg_ = deg;
-        bridge_->publishAngle(axis_name_, deg);
+        sendAngle(deg);
     }
 }
 
@@ -181,7 +198,7 @@ void AxisPanel::onAngleInputOnly()
         position_deg_, -360.0, 360.0, 2, &ok);
     if (ok) {
         position_deg_ = deg;
-        bridge_->publishAngle(axis_name_, deg);
+        sendAngle(deg);
     }
 }
 
@@ -194,7 +211,61 @@ void AxisPanel::onDispInputOnly()
         position_mm_, -10000.0, 10000.0, 3, &ok);
     if (ok) {
         position_mm_ = val;
-        bridge_->publishDisplacement(axis_name_, val);
+        sendDisplacement(val);
         updatePositionDisplay(val);
+    }
+}
+
+// ————— 速度百分比辅助 —————
+// 百分比相对该轴的 max_jog_speed，取值 5~100 的整数。
+// 控制器会拒收 <5、>100 以及 "70.0" 这类非整数写法，因此这里只提供整数档位，
+// 并且不提供 0："默认"档走不带百分比的原话题，而不是发送 0。
+void AxisPanel::initSpeedCombo()
+{
+    speed_pct_combo_ = new QComboBox(this);
+
+    // 索引 0 = "默认"：userData 为无效 QVariant，selectedPercent() 据此返回 -1
+    speed_pct_combo_->addItem("默认", QVariant());
+
+    static const int kPercents[] = {5, 10, 20, 30, 50, 70, 80, 100};
+    for (int pct : kPercents) {
+        speed_pct_combo_->addItem(QString::number(pct) + "%", pct);
+    }
+
+    speed_pct_combo_->setCurrentIndex(0);   // 默认档，保持原有操作手感
+    speed_pct_combo_->setToolTip(
+        "移动速度百分比（相对该轴 max_jog_speed，范围 5~100）\n"
+        "\"默认\" = 使用 axes_config.yaml 中该轴的 auto_speed");
+}
+
+int AxisPanel::selectedPercent() const
+{
+    if (!speed_pct_combo_) {
+        return -1;   // 无控件（理论上不会发生）→ 退回默认速度
+    }
+    bool ok = false;
+    const int pct = speed_pct_combo_->currentData().toInt(&ok);
+    return ok ? pct : -1;   // "默认"档 userData 无效 → ok=false → -1
+}
+
+void AxisPanel::sendDisplacement(double position_mm)
+{
+    const int pct = selectedPercent();
+    if (pct < 0) {
+        // 默认速度：控制器使用该轴 YAML 的 auto_speed
+        bridge_->publishDisplacement(axis_name_, position_mm);
+    } else {
+        // 指定百分比：走 /displacement_command_pct
+        bridge_->publishDisplacementPct(axis_name_, position_mm, pct);
+    }
+}
+
+void AxisPanel::sendAngle(double angle_deg)
+{
+    const int pct = selectedPercent();
+    if (pct < 0) {
+        bridge_->publishAngle(axis_name_, angle_deg);
+    } else {
+        bridge_->publishAnglePct(axis_name_, angle_deg, pct);
     }
 }
